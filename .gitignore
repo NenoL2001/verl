@@ -21,7 +21,7 @@ tensorflow/my_graph/*
 
 # Distribution / packaging
 .Python
-# env/
+env/
 build/
 develop-eggs/
 dist/
@@ -114,9 +114,6 @@ ENV/
 # vim
 *.swp
 
-# emacs
-*~
-
 # ckpt
 *.lock
 
@@ -129,3 +126,8 @@ logs
 log
 outputs
 .history
+__pycache__/
+*.py[cod]
+*.so
+build/
+.dist/
