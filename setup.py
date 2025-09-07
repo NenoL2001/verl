@@ -37,27 +37,30 @@ install_requires = [
     "pylatexenc",
     "ray[default]>=2.41.0",
     "torchdata",
-    "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "tensordict>=0.8.0,<=0.9.1,!=0.9.0",
     "transformers",
     "wandb",
     "packaging>=20.0",
     "tensorboard",
 ]
 
-TEST_REQUIRES = ["pytest", "pre-commit", "py-spy", "pytest-asyncio", "pytest-rerunfailures"]
+TEST_REQUIRES = ["pytest", "pre-commit", "py-spy", "pytest-asyncio"]
 PRIME_REQUIRES = ["pyext"]
 GEO_REQUIRES = ["mathruler", "torchvision", "qwen_vl_utils"]
 GPU_REQUIRES = ["liger-kernel", "flash-attn"]
 MATH_REQUIRES = ["math-verify"]  # Add math-verify as an optional dependency
-VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.8.5,<=0.11.0"]
+VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.9.1,!=0.9.0", "vllm>=0.7.3,<=0.9.1"]
 SGLANG_REQUIRES = [
-    "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
-    "sglang[srt,openai]==0.5.5",
-    "torch==2.8.0",
+    "tensordict>=0.8.0,<=0.9.1,!=0.9.0",
+    "sglang[srt,openai]==0.4.10.post2",
+    "torch==2.7.1",
 ]
 TRL_REQUIRES = ["trl<=0.9.6"]
 MCORE_REQUIRES = ["mbridge"]
-TRANSFERQUEUE_REQUIRES = ["TransferQueue==0.1.2.dev0"]
+DEEPSPEED_REQUIRES = [
+    "deepspeed>=0.14.0",  # core DeepSpeed
+    "triton",  # kernels (optional, many wheels bundle it)
+]
 
 extras_require = {
     "test": TEST_REQUIRES,
@@ -69,7 +72,7 @@ extras_require = {
     "sglang": SGLANG_REQUIRES,
     "trl": TRL_REQUIRES,
     "mcore": MCORE_REQUIRES,
-    "transferqueue": TRANSFERQUEUE_REQUIRES,
+    "deepspeed": DEEPSPEED_REQUIRES,
 }
 
 
