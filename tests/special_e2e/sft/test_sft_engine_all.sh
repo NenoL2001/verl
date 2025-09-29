@@ -47,6 +47,12 @@ BACKEND=megatron TP_SIZE=2 PP_SIZE=2 VPP_SIZE=2 CP_SIZE=1 NUM_GPUS=8 bash tests/
 echo "run with tp2 pp2 vpp2 cp2 num_gpus8"
 BACKEND=megatron TP_SIZE=2 PP_SIZE=2 VPP_SIZE=2 CP_SIZE=2 NUM_GPUS=8 bash tests/special_e2e/sft/run_sft_engine_gsm8k.sh
 
+# test with deepspeed
+echo "run deepspeed with single gpu"
+BACKEND=deepspeed SP_SIZE=1 NUM_GPUS=1 PARAM_OFFLOAD=False OPTIMIZER_OFFLOAD=False MIXED_PRECISION=bf16 bash tests/special_e2e/sft/run_sft_engine_gsm8k.sh
+echo "run deepspeed with sp2 num_gpus8"
+BACKEND=deepspeed SP_SIZE=2 NUM_GPUS=8 PARAM_OFFLOAD=False OPTIMIZER_OFFLOAD=False MIXED_PRECISION=bf16 bash tests/special_e2e/sft/run_sft_engine_gsm8k.sh
+
 python3 tests/special_e2e/sft/compare_sft_engine_results.py
 
 rm -rf ~/verl/test/log
