@@ -286,3 +286,14 @@ class DeepSpeedCriticConfig(CriticConfig):
         super().__post_init__()
         if self.zero_stage not in [0, 1, 2, 3]:
             raise ValueError(f"zero_stage must be 0, 1, 2, or 3, got {self.zero_stage}")
+
+        # Validate that when both SP fields are explicitly set (>1), they are consistent.
+        sp_top = getattr(self, "ulysses_sequence_parallel_size", 1)
+        sp_engine = getattr(self.deepspeed_config, "ulysses_sequence_parallel_size", 1)
+        if sp_top > 1 and sp_engine > 1 and sp_top != sp_engine:
+            raise ValueError(
+                "DeepSpeedCriticConfig ulysses_sequence_parallel_size mismatch: "
+                f"top-level={sp_top}, deepspeed_config={sp_engine}. "
+                "Please set them to the same value or configure only "
+                "deepspeed_config.ulysses_sequence_parallel_size."
+            )

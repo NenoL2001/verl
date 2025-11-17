@@ -477,6 +477,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.torch_random_states = device.get_rng_state()
         self.gen_random_states = self.torch_random_states.clone()
 
+        # vLLM 的 CuMemAllocator 与 PyTorch 的 expandable_segments 模式不兼容：
+        # 若 PYTORCH_CUDA_ALLOC_CONF 中包含 "expandable_segments:True"，会直接触发断言并中止初始化。
+        # 在此处对该环境变量进行本进程内的清理，避免 rollout 构建阶段报错，
+        # 同时不影响 DeepSpeed 训练端的行为（训练端在构建完成后才进入 rollout 模式）。
+        try:
+            conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+            if "expandable_segments:True" in conf:
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ""
+        except Exception:
+            pass
+
         rollout_config = omega_conf_to_dataclass(self.config.rollout, dataclass_type=RolloutConfig)
         model_config = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
 

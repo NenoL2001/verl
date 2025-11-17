@@ -130,6 +130,10 @@ class FSDPEngineConfig(BaseConfig):
 class DeepSpeedEngineConfig(BaseConfig):
     """Configuration for DeepSpeed engine (minimal subset)."""
 
+    # Allow updating ulysses_sequence_parallel_size in __post_init__ of higher-level configs
+    # to keep top-level and engine-level SP sizes in sync when needed.
+    _mutable_fields = {"ulysses_sequence_parallel_size"}
+
     # offload & parallel
     param_offload: bool = False
     optimizer_offload: bool = False

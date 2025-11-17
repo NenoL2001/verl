@@ -1162,22 +1162,24 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
+                    print(f"[TRACE][trainer] step={self.global_steps} enter compute_log_prob")
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                    print(f"[TRACE][trainer] step={self.global_steps} exit compute_log_prob")
+                    entropys = old_log_prob.batch["entropys"]
+                    response_masks = batch.batch["response_mask"]
+                    loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                    entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                    old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                    metrics.update(old_log_prob_metrics)
+                    old_log_prob.batch.pop("entropys")
+                    batch = batch.union(old_log_prob)
 
-                        if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            from verl.utils.debug.metrics import calculate_debug_metrics
+                    if "rollout_log_probs" in batch.batch.keys():
+                        # TODO: we may want to add diff of probs too.
+                        from verl.utils.debug.metrics import calculate_debug_metrics
 
-                            metrics.update(calculate_debug_metrics(batch))
+                        metrics.update(calculate_debug_metrics(batch))
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1190,9 +1192,11 @@ class RayPPOTrainer:
 
                     # compute values
                     if self.use_critic:
+                        print(f"[TRACE][trainer] step={self.global_steps} enter compute_values")
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+                        print(f"[TRACE][trainer] step={self.global_steps} exit compute_values")
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
@@ -1237,17 +1241,21 @@ class RayPPOTrainer:
 
                     # update critic
                     if self.use_critic:
+                        print(f"[TRACE][trainer] step={self.global_steps} enter update_critic")
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self.critic_wg.update_critic(batch)
+                        print(f"[TRACE][trainer] step={self.global_steps} exit update_critic")
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        print(f"[TRACE][trainer] step={self.global_steps} enter update_actor")
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                        print(f"[TRACE][trainer] step={self.global_steps} exit update_actor")
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 

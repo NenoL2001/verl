@@ -70,7 +70,17 @@ class DataParallelPPOActor(BasePPOActor):
         if torch.distributed.get_rank() == 0:
             print(f"{role} use_fused_kernels={self.use_fused_kernels}")
 
-        self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
+        # For DeepSpeed-based PPO actor, prefer the Ulysses SP size from the nested
+        # DeepSpeedEngineConfig so that compute-side SP matches the engine's
+        # communication groups. The top-level ulysses_sequence_parallel_size is mainly
+        # used by FSDP/megatron paths and for backward compatibility.
+        sp_size = getattr(self.config, "ulysses_sequence_parallel_size", 1)
+        if hasattr(self.config, "deepspeed_config"):
+            engine_sp = getattr(self.config.deepspeed_config, "ulysses_sequence_parallel_size", 1)
+            if engine_sp > 1:
+                sp_size = engine_sp
+
+        self.ulysses_sequence_parallel_size = sp_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
         if self.config.entropy_from_logits_with_chunking:
