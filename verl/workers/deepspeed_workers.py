@@ -107,6 +107,7 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerCon
 from verl.utils.profiler.performance import reduce_timing, simple_timer, topk_reduce_ratio_min_max
 from verl.utils.py_functional import append_to_dict, convert_to_regular_types
 from verl.utils.seqlen_balancing import prepare_dynamic_batch
+from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import masked_mean
 from verl.trainer.ppo import core_algos
@@ -1793,6 +1794,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         )
 
         self.config = config
+        self.layout: ParallelLayout | None = None
+        self.reward_sharding_manager: DeepSpeedUlyssesShardingManager | None = None
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend=get_nccl_backend(),
@@ -1801,17 +1804,18 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id() if torch.cuda.is_available() else None,
             )
 
-        # Note: DeepSpeed doesn't support Ulysses SP, so ulysses_sequence_parallel_size is always 1
-        self.ulysses_sequence_parallel_size = 1
+        # Build layout (supports DP; optional SP via ulysses_sequence_parallel_size)
+        self.layout = build_parallel_layout(self.config)
+        self.ulysses_sequence_parallel_size = self.layout.sp_size
 
         # Create training dispatch
-        self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
+        self._register_dispatch_collect_info("reward", dp_rank=self.layout.dp_rank, is_collect=self.layout.collect)
 
         self.use_remove_padding = self.config.model.get("use_remove_padding", False)
 
         # Normalize config
         if self.config.micro_batch_size is not None:
-            self.config.micro_batch_size //= torch.distributed.get_world_size()
+            self.config.micro_batch_size //= self.layout.dp_size
             self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
 
         self._is_offload_param = self.config.deepspeed_config.get("param_offload", False)
@@ -1860,13 +1864,28 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 trust_remote_code=trust_remote_code,
             )
 
+            # Initialize Ulysses SP group if requested
+            sp_size = self.ulysses_sequence_parallel_size
+            sp_group = None
+            prev_sp_group = get_ulysses_sequence_parallel_group()
+            if sp_size > 1 and torch.distributed.is_initialized():
+                ranks = list(range(self.layout.dp_rank * sp_size, (self.layout.dp_rank + 1) * sp_size))
+                sp_group = torch.distributed.new_group(ranks=ranks, backend=get_nccl_backend())
+                set_ulysses_sequence_parallel_group(sp_group)
+                torch.distributed.barrier(group=sp_group)
+
             apply_monkey_patch(
                 model=reward_module,
                 use_remove_padding=config.model.get("use_remove_padding", False),
-                ulysses_sp_size=1,  # DeepSpeed doesn't support Ulysses SP
+                ulysses_sp_size=sp_size,
             )
 
             reward_module.to(torch_dtype)
+
+        if sp_group is not None:
+            torch.distributed.barrier(group=sp_group)
+        set_ulysses_sequence_parallel_group(prev_sp_group)
+        self.reward_sharding_manager = DeepSpeedUlyssesShardingManager(sp_group)
 
         # Initialize DeepSpeed for inference (no optimizer)
         # Parse mixed precision config
@@ -1921,6 +1940,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             position_ids = micro_batch["position_ids"]
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
+            sp_size = self.ulysses_sequence_parallel_size
 
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(
@@ -1940,12 +1960,25 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                         rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
                     ).transpose(0, 1)
 
+                # pad and slice the inputs if sp > 1
+                pad_size = 0
+                if sp_size > 1:
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad, position_ids_rmpad, sp_size=sp_size
+                    )
+
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 output = self.reward_module(
                     input_ids=input_ids_rmpad, attention_mask=None, position_ids=position_ids_rmpad, use_cache=False
                 )
                 reward_rmpad = output.logits
                 reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
+
+                # gather output if sp > 1
+                if sp_size > 1:
+                    reward_rmpad = gather_outputs_and_unpad(
+                        reward_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                    )
 
                 # pad it back
                 rm_score = pad_input(reward_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)
@@ -2066,18 +2099,20 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         num_micro_batches = (batch_size + micro_batch_size - 1) // micro_batch_size
 
         all_scores = []
-        for i in range(num_micro_batches):
-            start_idx = i * micro_batch_size
-            end_idx = min((i + 1) * micro_batch_size, batch_size)
+        manager = self.reward_sharding_manager if self.reward_sharding_manager is not None else nullcontext()
+        with manager:
+            for i in range(num_micro_batches):
+                start_idx = i * micro_batch_size
+                end_idx = min((i + 1) * micro_batch_size, batch_size)
 
-            micro_batch = {
-                "input_ids": data.batch["input_ids"][start_idx:end_idx],
-                "attention_mask": data.batch["attention_mask"][start_idx:end_idx],
-                "position_ids": data.batch["position_ids"][start_idx:end_idx],
-            }
+                micro_batch = {
+                    "input_ids": data.batch["input_ids"][start_idx:end_idx],
+                    "attention_mask": data.batch["attention_mask"][start_idx:end_idx],
+                    "position_ids": data.batch["position_ids"][start_idx:end_idx],
+                }
 
-            scores = self._forward_micro_batch(micro_batch)
-            all_scores.append(scores)
+                scores = self._forward_micro_batch(micro_batch)
+                all_scores.append(scores)
 
         # Concatenate all scores
         rm_scores = torch.cat(all_scores, dim=0)
