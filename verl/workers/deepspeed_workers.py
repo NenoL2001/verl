@@ -70,6 +70,12 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.third_party.vllm import vllm_version
 from verl.utils import hf_processor, hf_tokenizer
+from verl.workers.deepspeed_parallel import (
+    ParallelLayout,
+    build_parallel_layout,
+    normalize_actor_batches,
+    normalize_critic_batches,
+)
 from verl.utils.checkpoint.deepspeed_checkpoint_manager import DeepSpeedCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.deepspeed_utils import (
@@ -151,6 +157,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.config = config
         self.actor_sharding_manager = None
         self.ref_sharding_manager = None
+        self.actor_layout: ParallelLayout | None = None
+        self.ref_layout: ParallelLayout | None = None
 
         rollout_cfg = self.config.get("rollout", {}) if isinstance(self.config, DictConfig) else {}
         self._skip_rollout = rollout_cfg.get("skip_rollout", False)
@@ -188,11 +196,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
-
-        if self._is_actor:
-            self._register_dispatch_collect_info("actor", dp_rank=self.rank, is_collect=True)
-        if self._is_ref:
-            self._register_dispatch_collect_info("ref", dp_rank=self.rank, is_collect=True)
 
         # Setup profiler
         if self._is_actor:
@@ -235,36 +238,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             deepspeed_config = self.config.ref.deepspeed_config
             self._is_offload_param = deepspeed_config.get("param_offload", False)
 
-        # Normalize batch size config (similar to FSDP worker)
+        # Build parallel layouts and normalize configs
         if self._is_actor:
-            world_size = torch.distributed.get_world_size()
-            self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-            self.config.actor.ppo_mini_batch_size //= world_size
-            assert self.config.actor.ppo_mini_batch_size > 0
+            tp_size = rollout_cfg.get("tensor_model_parallel_size", 1) if isinstance(rollout_cfg, dict) else 1
+            self.actor_layout = build_parallel_layout(self.config.actor, tp_size=tp_size)
+            normalize_actor_batches(self.config.actor, self.config.rollout.n, self.actor_layout.dp_size)
+            self.actor_ulysses_sequence_parallel_size = self.actor_layout.sp_size
+            self.ulysses_sequence_parallel_size = self.actor_layout.sp_size  # backward compat
+            self._register_dispatch_collect_info(
+                "actor", dp_rank=self.actor_layout.dp_rank, is_collect=self.actor_layout.collect
+            )
+        else:
+            self.actor_ulysses_sequence_parallel_size = 1
+            self.ulysses_sequence_parallel_size = 1
 
-            if self.config.actor.ppo_micro_batch_size is not None:
-                self.config.actor.ppo_micro_batch_size //= world_size
-                self.config.actor.ppo_micro_batch_size_per_gpu = self.config.actor.ppo_micro_batch_size
-
-            if self.config.actor.ppo_micro_batch_size_per_gpu is not None:
-                assert self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0
+        if self._is_ref:
+            self.ref_layout = build_parallel_layout(self.config.ref)
+            self.ref_ulysses_sequence_parallel_size = self.ref_layout.sp_size
+            self._register_dispatch_collect_info(
+                "ref", dp_rank=self.ref_layout.dp_rank, is_collect=self.ref_layout.collect
+            )
+        else:
+            self.ref_ulysses_sequence_parallel_size = 1
 
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self._lora_rank > 0
-
-        # Ulysses sequence parallel configs per role (align with FSDP semantics)
-        self.actor_ulysses_sequence_parallel_size = 1
-        if self._is_actor and hasattr(self.config.actor, "deepspeed_config"):
-            self.actor_ulysses_sequence_parallel_size = int(
-                self.config.actor.deepspeed_config.get("ulysses_sequence_parallel_size", 1)
-            )
-        self.ref_ulysses_sequence_parallel_size = 1
-        if self._is_ref and hasattr(self.config, "ref") and hasattr(self.config.ref, "deepspeed_config"):
-            self.ref_ulysses_sequence_parallel_size = int(
-                self.config.ref.deepspeed_config.get("ulysses_sequence_parallel_size", 1)
-            )
-        # Backward compatibility: actor paths still reference self.ulysses_sequence_parallel_size
-        self.ulysses_sequence_parallel_size = self.actor_ulysses_sequence_parallel_size
 
     def _build_model_optimizer(
         self,
@@ -278,6 +276,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         trust_remote_code: bool = False,
         use_liger: bool = False,
         role: str = "actor",
+        layout: ParallelLayout | None = None,
     ):
         """
         Build model and optimizer using native DeepSpeed API.
@@ -361,7 +360,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
             # Initialize Ulysses SP group for DeepSpeed-HF if requested
-            if role == "actor":
+            if layout is not None:
+                sp_size = layout.sp_size
+            elif role == "actor":
                 sp_size = self.actor_ulysses_sequence_parallel_size
                 self.ulysses_sequence_parallel_size = sp_size
             elif role == "ref":
@@ -371,11 +372,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             sp_group = None
             prev_sp_group = get_ulysses_sequence_parallel_group()
             if sp_size > 1 and torch.distributed.is_initialized():
-                world = torch.distributed.get_world_size()
-                assert world % sp_size == 0, f"world_size {world} must be divisible by ulysses sp_size {sp_size}"
-                rank = torch.distributed.get_rank()
-                group_id = rank // sp_size
-                ranks = list(range(group_id * sp_size, (group_id + 1) * sp_size))
+                # Use layout to build per-DP SP group to avoid cross-role pollution
+                if layout is None:
+                    world = torch.distributed.get_world_size()
+                    assert world % sp_size == 0, f"world_size {world} must be divisible by ulysses sp_size {sp_size}"
+                    rank = torch.distributed.get_rank()
+                    group_id = rank // sp_size
+                    ranks = list(range(group_id * sp_size, (group_id + 1) * sp_size))
+                else:
+                    ranks = list(
+                        range(layout.dp_rank * layout.sp_size, (layout.dp_rank + 1) * layout.sp_size)
+                    )
                 sp_group = torch.distributed.new_group(ranks=ranks, backend=get_nccl_backend())
                 set_ulysses_sequence_parallel_group(sp_group)
                 # synchronize all ranks inside the SP group before patching
@@ -434,10 +441,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             zero_stage = getattr(self.config.actor, "zero_stage", deepspeed_config.get("zero_stage", 2))
 
-            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            dp_size = layout.dp_size if layout is not None else (
+                torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            )
             per_rank_mini = self.config.actor.ppo_mini_batch_size
             micro_bsz = self.config.actor.get("ppo_micro_batch_size_per_gpu", 1) or 1
-            ds_train_batch_size = max(1, per_rank_mini * world_size)
+            ds_train_batch_size = max(1, per_rank_mini * dp_size)
             ds_grad_accum = max(1, per_rank_mini // micro_bsz)
 
             ds_config = get_deepspeed_config(
@@ -513,7 +522,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             num_heads = _extract_num_heads(hf_cfg)
             num_kv_heads = _extract_num_kv_heads(hf_cfg)
-            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            # Use DP world (not counting SP) for rollout TP validation when actor uses Ulysses
+            world_size = (
+                self.actor_layout.dp_size
+                if self.actor_layout is not None
+                else (torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1)
+            )
             req_tp = int(getattr(rollout_config, "tensor_model_parallel_size", 1) or 1)
             def _divides_all(tp):
                 cond1 = (num_heads is None) or (num_heads % tp == 0)
@@ -542,7 +556,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Register dispatch info so Ray routing knows how to gather rollout outputs
-        self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
+        if self.actor_layout is not None:
+            self._register_dispatch_collect_info(
+                "rollout", dp_rank=self.actor_layout.dp_rank, is_collect=self.actor_layout.collect
+            )
+        else:
+            self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
 
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
 
@@ -724,6 +743,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=trust_remote_code,
                 use_liger=self.config.model.get("use_liger", False),
                 role="actor",
+                layout=self.actor_layout,
             )
 
             if self._is_offload_param and self.actor_engine is not None:
@@ -766,6 +786,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=trust_remote_code,
                 use_liger=self.config.model.get("use_liger", False),
                 role="ref",
+                layout=self.ref_layout,
             )
 
             OmegaConf.set_struct(self.config.ref, True)
@@ -1404,6 +1425,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         self.config: DeepSpeedCriticConfig = critic_config
         self.critic_sharding_manager = None
+        self.layout: ParallelLayout | None = None
 
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
@@ -1420,13 +1442,17 @@ class CriticWorker(Worker, DistProfilerExtension):
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=None)
         )
 
-        self._register_dispatch_collect_info("critic", dp_rank=self.rank, is_collect=True)
+        # Build layout & register dispatch on DP dimension
+        self.layout = build_parallel_layout(self.config)
+        self._register_dispatch_collect_info("critic", dp_rank=self.layout.dp_rank, is_collect=self.layout.collect)
 
         self._is_offload_param = self.config.deepspeed_config.get("param_offload", False)
         # Ulysses SP for critic dynamic batching
-        self.ulysses_sequence_parallel_size = int(self.config.deepspeed_config.get("ulysses_sequence_parallel_size", 1))
+        self.ulysses_sequence_parallel_size = self.layout.sp_size
         self._lora_rank = getattr(self.config.model, "lora_rank", 0)
         self._is_lora = self._lora_rank > 0
+
+        normalize_critic_batches(self.config, self.layout.dp_size)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -1494,11 +1520,14 @@ class CriticWorker(Worker, DistProfilerExtension):
         sp_group = None
         prev_sp_group = get_ulysses_sequence_parallel_group()
         if sp_size > 1 and torch.distributed.is_initialized():
-            world = torch.distributed.get_world_size()
-            assert world % sp_size == 0, f"world_size {world} must be divisible by ulysses sp_size {sp_size}"
-            rank = torch.distributed.get_rank()
-            group_id = rank // sp_size
-            ranks = list(range(group_id * sp_size, (group_id + 1) * sp_size))
+            if self.layout is not None:
+                ranks = list(range(self.layout.dp_rank * sp_size, (self.layout.dp_rank + 1) * sp_size))
+            else:
+                world = torch.distributed.get_world_size()
+                assert world % sp_size == 0, f"world_size {world} must be divisible by ulysses sp_size {sp_size}"
+                rank = torch.distributed.get_rank()
+                group_id = rank // sp_size
+                ranks = list(range(group_id * sp_size, (group_id + 1) * sp_size))
             sp_group = torch.distributed.new_group(ranks=ranks, backend=get_nccl_backend())
             set_ulysses_sequence_parallel_group(sp_group)
             torch.distributed.barrier(group=sp_group)
@@ -1547,10 +1576,12 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         zero_stage = getattr(self.config, "zero_stage", self.config.deepspeed_config.get("zero_stage", 2))
 
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        dp_size = self.layout.dp_size if self.layout is not None else (
+            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        )
         per_rank_mini = self.config.ppo_mini_batch_size
         micro_bsz = self.config.get("ppo_micro_batch_size_per_gpu", 1) or 1
-        ds_train_batch_size = max(1, per_rank_mini * world_size)
+        ds_train_batch_size = max(1, per_rank_mini * dp_size)
         ds_grad_accum = max(1, per_rank_mini // micro_bsz)
 
         ds_config = get_deepspeed_config(
