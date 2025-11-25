@@ -445,10 +445,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             dp_size = layout.dp_size if layout is not None else (
                 torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
             )
+            world_size = layout.world_size if layout is not None else (
+                torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            )
+            sp_size = layout.sp_size if layout is not None else 1
             per_rank_mini = self.config.actor.ppo_mini_batch_size
             micro_bsz = self.config.actor.get("ppo_micro_batch_size_per_gpu", 1) or 1
-            ds_train_batch_size = max(1, per_rank_mini * dp_size)
-            ds_grad_accum = max(1, per_rank_mini // micro_bsz)
+            ds_grad_accum = max(1, per_rank_mini // (micro_bsz * sp_size))
+            ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * world_size)
+
+            if self.rank == 0:
+                print(
+                    f"[ds-actor-config] sp_size={sp_size}, dp_size={dp_size}, world_size={world_size}, "
+                    f"per_rank_mini={per_rank_mini}, micro_bsz={micro_bsz}, grad_accum={ds_grad_accum}, "
+                    f"train_batch_size={ds_train_batch_size}"
+                )
 
             ds_config = get_deepspeed_config(
                 optimizer_type=optim_config.get("optimizer", "AdamW"),
@@ -1159,6 +1170,15 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
     def update_policy(self, data: DataProto):
         self.actor_module.train()
 
+        # Optional per-step RNG seed for reproducibility
+        if "rng_seed" in data.meta_info:
+            rng_seed = int(data.meta_info["rng_seed"])
+            if torch.distributed.get_rank() == 0:
+                print(f"[DS Actor] Setting RNG seed: {rng_seed}")
+            torch.manual_seed(rng_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(rng_seed)
+
         temperature = data.meta_info["temperature"]
 
         select_keys = [
@@ -1235,6 +1255,30 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                         config=self.config,
                         rollout_is_weights=None,
                     )
+
+                    # Diagnostic print to catch NaNs early
+                    def _stat(x):
+                        if x is None:
+                            return {"min": 0.0, "max": 0.0, "mean": 0.0, "nan": False, "inf": False}
+                        x_flat = x.float().detach().reshape(-1)
+                        return {
+                            "min": float(torch.nan_to_num(x_flat.min(), nan=0.0)),
+                            "max": float(torch.nan_to_num(x_flat.max(), nan=0.0)),
+                            "mean": float(torch.nan_to_num(x_flat.mean(), nan=0.0)),
+                            "nan": bool(torch.isnan(x_flat).any()),
+                            "inf": bool(torch.isinf(x_flat).any()),
+                        }
+
+                    if torch.distributed.get_rank() == 0:
+                        log_info = {
+                            "log_prob": _stat(log_prob),
+                            "old_log_prob": _stat(old_log_prob),
+                            "advantages": _stat(advantages),
+                            "pg_loss": _stat(pg_loss),
+                            "entropy": _stat(entropy),
+                        }
+                        if not torch.isfinite(pg_loss).all() or not torch.isfinite(log_prob).all():
+                            print(f"[ds-actor-nan] micro_idx={idx}, stats={log_info}")
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -1580,10 +1624,21 @@ class CriticWorker(Worker, DistProfilerExtension):
         dp_size = self.layout.dp_size if self.layout is not None else (
             torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         )
+        world_size = self.layout.world_size if self.layout is not None else (
+            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        )
+        sp_size = self.layout.sp_size if self.layout is not None else 1
         per_rank_mini = self.config.ppo_mini_batch_size
         micro_bsz = self.config.get("ppo_micro_batch_size_per_gpu", 1) or 1
-        ds_train_batch_size = max(1, per_rank_mini * dp_size)
-        ds_grad_accum = max(1, per_rank_mini // micro_bsz)
+        ds_grad_accum = max(1, per_rank_mini // (micro_bsz * sp_size))
+        ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * world_size)
+
+        if self.rank == 0:
+            print(
+                f"[ds-critic-config] sp_size={sp_size}, dp_size={dp_size}, world_size={world_size}, "
+                f"per_rank_mini={per_rank_mini}, micro_bsz={micro_bsz}, grad_accum={ds_grad_accum}, "
+                f"train_batch_size={ds_train_batch_size}"
+            )
 
         ds_config = get_deepspeed_config(
             optimizer_type=self.config.optim.get("optimizer", "AdamW"),

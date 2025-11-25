@@ -23,6 +23,33 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional dep
+    np = None
+
+try:
+    import torch
+except Exception:  # pragma: no cover - optional dep
+    torch = None
+
+
+def _json_default(obj):
+    """Best-effort JSON serializer for tensors/arrays used by FileLogger."""
+    if torch is not None and isinstance(obj, torch.Tensor):
+        return obj.item() if obj.numel() == 1 else obj.tolist()
+    if np is not None:
+        import numpy as _np
+
+        if isinstance(obj, _np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, _np.generic):
+            return obj.item()
+    try:
+        return obj.item()  # type: ignore[attr-defined]
+    except Exception:
+        return str(obj)
+
 
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
@@ -240,7 +267,7 @@ class FileLogger:
 
     def log(self, data, step):
         data = {"step": step, "data": data}
-        self.fp.write(json.dumps(data) + "\n")
+        self.fp.write(json.dumps(data, default=_json_default) + "\n")
 
     def finish(self):
         self.fp.close()

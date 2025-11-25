@@ -25,7 +25,7 @@ one entry point to:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from typing import Any
 
 import torch.distributed as dist
@@ -78,9 +78,17 @@ def resolve_and_sync_sp_size(role_cfg: Any) -> int:
 
     # Sync both views
     if hasattr(role_cfg, "ulysses_sequence_parallel_size"):
-        role_cfg.ulysses_sequence_parallel_size = sp_size
+        if _get_attr(role_cfg, "ulysses_sequence_parallel_size") != sp_size:
+            try:
+                role_cfg.ulysses_sequence_parallel_size = sp_size
+            except FrozenInstanceError:
+                pass
     if ds_cfg is not None and hasattr(ds_cfg, "ulysses_sequence_parallel_size"):
-        ds_cfg.ulysses_sequence_parallel_size = sp_size
+        if _get_attr(ds_cfg, "ulysses_sequence_parallel_size") != sp_size:
+            try:
+                ds_cfg.ulysses_sequence_parallel_size = sp_size
+            except FrozenInstanceError:
+                pass
 
     return int(sp_size)
 

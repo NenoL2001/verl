@@ -365,6 +365,10 @@ class vLLMRollout(BaseRollout):
             input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
 
         do_sample = prompts.meta_info.get("do_sample", True)
+        rng_seed = prompts.meta_info.get("rng_seed", None)
+        deterministic = os.getenv("VERL_DETERMINISTIC") == "1"
+        if deterministic:
+            do_sample = False
         is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
             kwargs = {
@@ -372,7 +376,7 @@ class vLLMRollout(BaseRollout):
                 "top_p": 1.0,
                 "top_k": -1,
                 "min_p": 0.0,
-                "temperature": 0,
+                "temperature": max(float(prompts.meta_info.get("temperature", 0)), 1e-5),
                 "n": 1,  # if greedy, only 1 response
             }
         elif is_validate:
@@ -380,7 +384,7 @@ class vLLMRollout(BaseRollout):
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
+                "temperature": max(float(self.config.val_kwargs.temperature), 1e-5) if deterministic else self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
@@ -395,6 +399,15 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            if rng_seed is not None:
+                seed_int = int(rng_seed)
+                self.sampling_params.seed = seed_int
+                if hasattr(self.sampling_params, "random_seed"):
+                    self.sampling_params.random_seed = seed_int
+                torch.manual_seed(seed_int)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed_int)
+
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,

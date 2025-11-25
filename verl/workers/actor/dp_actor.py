@@ -184,7 +184,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad.div_(temperature)
+                    if float(temperature) > 0:
+                        logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -263,7 +264,8 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits = output.logits
 
-                    logits.div_(temperature)
+                    if float(temperature) > 0:
+                        logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
@@ -271,6 +273,35 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+
+            # Debug logging to catch SP/rmpad issues early
+            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                def _stat(x: torch.Tensor):
+                    x_flat = x.float().detach().reshape(-1)
+                    return {
+                        "min": float(torch.nan_to_num(x_flat.min(), nan=0.0)),
+                        "max": float(torch.nan_to_num(x_flat.max(), nan=0.0)),
+                        "mean": float(torch.nan_to_num(x_flat.mean(), nan=0.0)),
+                        "nan": bool(torch.isnan(x_flat).any()),
+                        "inf": bool(torch.isinf(x_flat).any()),
+                        "all_zero": bool(torch.all(x_flat == 0)),
+                    }
+
+                has_nan = (not torch.isfinite(log_probs).all()) or (
+                    entropy is not None and not torch.isfinite(entropy).all()
+                )
+                all_zero = torch.all(log_probs == 0)
+                if has_nan:
+                    print(
+                        f"[ds-actor-fwd-nan] use_sp={self.use_ulysses_sp} use_rmpad={self.use_remove_padding} "
+                        f"safe_temp={safe_temperature} log_probs={_stat(log_probs)} "
+                        f"entropy={_stat(entropy) if entropy is not None else None}"
+                    )
+                elif all_zero:
+                    print(
+                        f"[ds-actor-fwd-zero] use_sp={self.use_ulysses_sp} use_rmpad={self.use_remove_padding} "
+                        f"safe_temp={safe_temperature} log_probs={_stat(log_probs)}"
+                    )
 
             return entropy, log_probs
 

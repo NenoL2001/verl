@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# DeepSpeed PPO benchmark: (1) 2x SP run, (2) 2x SP + 2x DP hybrid run.
+# Run DeepSpeed PPO benchmark with SP=2 in two modes:
+#   1) 2 GPUs (SP=2)
+#   2) 4 GPUs (DP=2 x SP=2 hybrid)
+# Both runs use 116 training steps with deterministic rollout (temperature=0, do_sample=False).
 
 ROOT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT_DIR"
@@ -31,6 +34,7 @@ common_args=(
   data.train_files="$TRAIN_FILES"
   data.val_files="$VAL_FILES"
   data.seed=42
+  actor_rollout_ref.rollout.seed=42
   data.train_batch_size=128
   actor_rollout_ref.actor.ppo_mini_batch_size=128
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8
@@ -43,6 +47,9 @@ common_args=(
   actor_rollout_ref.model.use_remove_padding=True
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.gpu_memory_utilization=0.12
+  actor_rollout_ref.rollout.tensor_model_parallel_size=1
+  actor_rollout_ref.rollout.temperature=0
+  actor_rollout_ref.rollout.do_sample=False
   critic.ulysses_sequence_parallel_size=2
   critic.deepspeed_config.ulysses_sequence_parallel_size=2
   critic.ppo_mini_batch_size=128
@@ -50,13 +57,13 @@ common_args=(
   critic.gradient_accumulation_steps=8
   critic.deepspeed_config.model_dtype=bf16
   critic.deepspeed_config.mixed_precision=bf16
-  trainer.total_training_steps=2
+  trainer.total_training_steps=116
   trainer.total_epochs=1
   trainer.logger='["console","file"]'
   trainer.resume_mode=disable
 )
 
-echo "[run] 2-GPU actor with SP=2"
+echo "[run] 2-GPU actor with SP=2 (116 steps)"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 python3 -m verl.trainer.main_ppo \
   "${common_args[@]}" \
@@ -64,10 +71,9 @@ python3 -m verl.trainer.main_ppo \
   trainer.nnodes=1 \
   +ray_kwargs.ray_init.num_gpus=2 \
   +ray_kwargs.ray_init.num_cpus=8 \
-  actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-  > "$LOG_DIR/actor_sp2_2gpu_$(ts).log" 2>&1
+  > "$LOG_DIR/actor_sp2_2gpu_116_$(ts).log" 2>&1
 
-echo "[run] 4-GPU actor with DP=2 x SP=2"
+echo "[run] 4-GPU actor with DP=2 x SP=2 (116 steps)"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES_4GPU:-0,1,2,3}
 python3 -m verl.trainer.main_ppo \
   "${common_args[@]}" \
@@ -75,7 +81,6 @@ python3 -m verl.trainer.main_ppo \
   trainer.nnodes=1 \
   +ray_kwargs.ray_init.num_gpus=4 \
   +ray_kwargs.ray_init.num_cpus=16 \
-  actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-  > "$LOG_DIR/actor_sp2_dp2_4gpu_$(ts).log" 2>&1
+  > "$LOG_DIR/actor_sp2_dp2_4gpu_116_$(ts).log" 2>&1
 
 echo "[done] Logs saved to $LOG_DIR"
