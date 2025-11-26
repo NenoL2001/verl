@@ -19,7 +19,6 @@ to perform generation.
 """
 
 import contextlib
-import os
 
 import torch
 import torch.distributed
@@ -58,9 +57,6 @@ class HFRollout(BaseRollout):
         is_validate = prompts.meta_info.get("validate", False)
 
         temperature = prompts.meta_info.get("temperature", self.config.temperature)
-        if os.getenv("VERL_DETERMINISTIC") == "1":
-            do_sample = False
-        safe_temperature = max(float(temperature), 1e-5)
         response_length = prompts.meta_info.get("response_length", self.config.response_length)
         top_p = prompts.meta_info.get("top_p", self.config.get("top_p", 1.0))
         top_k = max(0, prompts.meta_info.get("top_k", self.config.get("top_k", 0)))  # to be compatible with vllm
@@ -78,7 +74,7 @@ class HFRollout(BaseRollout):
                 "num_beams": 1,
                 "top_k": max(0, self.config.val_kwargs.top_k),  # to be compatible with vllm
                 "top_p": self.config.val_kwargs.top_p,
-                "temperature": safe_temperature if os.getenv("VERL_DETERMINISTIC") == "1" else self.config.val_kwargs.temperature,
+                "temperature": self.config.val_kwargs.temperature,
                 "num_return_sequences": 1,  # if validate, already repeat in ray_trainer
             }
         else:
@@ -88,7 +84,7 @@ class HFRollout(BaseRollout):
                 "num_beams": 1,
                 "top_p": top_p,
                 "top_k": top_k,
-                "temperature": safe_temperature,
+                "temperature": temperature,
                 # already repeat in ray_trainer
                 # https://github.com/volcengine/verl/blob/2fdfbdcba6f2e076f64bc47922d8fe6cf7dc7da5/verl/trainer/ppo/ray_trainer.py#L1117
                 "num_return_sequences": 1,
@@ -101,13 +97,6 @@ class HFRollout(BaseRollout):
         prompt_length = idx.size(1)
         attention_mask = prompts.batch["attention_mask"]  # left-padded attention_mask
         position_ids = prompts.batch["position_ids"]
-
-        # Apply per-step RNG seed if provided
-        rng_seed = prompts.meta_info.get("rng_seed", None)
-        if rng_seed is not None:
-            torch.manual_seed(int(rng_seed))
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(int(rng_seed))
 
         # used to construct attention_mask
         eos_token_id = prompts.meta_info["eos_token_id"]

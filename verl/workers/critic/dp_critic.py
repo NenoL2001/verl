@@ -45,6 +45,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
         self.use_remove_padding = self.config.model.get("use_remove_padding", False)
+        print(f"Critic use_remove_padding={self.use_remove_padding}")
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
@@ -133,12 +134,6 @@ class DataParallelPPOCritic(BasePPOCritic):
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
-        params_before = None
-        if torch.distributed.get_rank() == 0:
-            params_before = torch.cat(
-                [p.data.detach().flatten() for p in self.critic_module.parameters()]
-            )
-
         if isinstance(self.critic_module, FSDP):
             grad_norm = self.critic_module.clip_grad_norm_(self.config.grad_clip)
         elif isinstance(self.critic_module, FSDPModule):
@@ -148,14 +143,10 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm is not finite: {grad_norm}")
             self.critic_optimizer.zero_grad()
         else:
             self.critic_optimizer.step()
-            if params_before is not None:
-                params_after = torch.cat(
-                    [p.data.detach().flatten() for p in self.critic_module.parameters()]
-                )
-                _ = torch.norm(params_after - params_before).item()
         return grad_norm
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
@@ -201,16 +192,6 @@ class DataParallelPPOCritic(BasePPOCritic):
     def update_critic(self, data: DataProto):
         # make sure we are in training mode
         self.critic_module.train()
-
-        # IMPORTANT: Set deterministic RNG state to ensure reproducibility
-        # This is critical because previous operations (e.g., actor training) may have
-        # consumed different amounts of randomness in FSDP vs DeepSpeed
-        if 'rng_seed' in data.meta_info:
-            rng_seed = data.meta_info['rng_seed']
-            torch.manual_seed(rng_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(rng_seed)
-
         metrics = {}
 
         select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
@@ -236,7 +217,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                 self.critic_optimizer.zero_grad()
 
-                for idx, micro_batch in enumerate(micro_batches):
+                for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -245,7 +226,6 @@ class DataParallelPPOCritic(BasePPOCritic):
                     returns = model_inputs["returns"]
 
                     vpreds = self._forward_micro_batch(model_inputs)
-
                     vf_loss, vf_clipfrac = core_algos.compute_value_loss(
                         vpreds=vpreds,
                         values=values,
@@ -273,23 +253,6 @@ class DataParallelPPOCritic(BasePPOCritic):
                     )
 
                     append_to_dict(metrics, micro_batch_metrics)
-
-                pre_clip_norm = float("nan")
-                grad_tensors = [
-                    p.grad.detach().flatten()
-                    for p in self.critic_module.parameters()
-                    if p.grad is not None
-                ]
-                if grad_tensors:
-                    pre_clip_norm = torch.cat(grad_tensors).norm().item()
-                grad_tensors_cpu = [
-                    p.grad.detach().flatten().to(torch.float64).cpu()
-                    for p in self.critic_module.parameters()
-                    if p.grad is not None
-                ]
-                self._last_pre_clip_grad = (
-                    torch.cat(grad_tensors_cpu) if grad_tensors_cpu else torch.tensor([], dtype=torch.float64)
-                )
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"critic/grad_norm": grad_norm.detach().item()}
