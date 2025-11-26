@@ -267,37 +267,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                         loss_scale_factor = 1 / self.gradient_accumulation
                         loss = vf_loss * loss_scale_factor
 
-                    if (
-                        not self.config.use_dynamic_bsz
-                        and idx == len(micro_batches) - 1
-                        and torch.distributed.get_rank() == 0
-                    ):
-                        print(
-                            f"[DEBUG][FSDP Critic] loss_scale_factor={loss_scale_factor:.6f}, "
-                            f"grad_accum_steps={self.gradient_accumulation}"
-                        )
-
-                    if torch.distributed.get_rank() == 0:
-                        print(
-                            f"[DEBUG][FSDP Critic] micro_batch={idx}, scaled_loss_dtype={loss.dtype}, "
-                            f"vf_loss_dtype={vf_loss.dtype}"
-                        )
-
                     loss.backward()
-                    if torch.distributed.get_rank() == 0:
-                        grad_vec = [
-                            p.grad.detach().flatten().to(torch.float32)
-                            for p in self.critic_module.parameters()
-                            if p.grad is not None
-                        ]
-                        micro_grad_norm = (
-                            torch.norm(torch.cat(grad_vec)).item() if grad_vec else float("nan")
-                        )
-                        print(
-                            f"[DEBUG][FSDP Critic] micro_batch={idx}, vf_loss={vf_loss.item():.6f}, "
-                            f"loss_scale_factor={loss_scale_factor:.6f}, "
-                            f"micro_grad_norm={micro_grad_norm:.6f}"
-                        )
 
                     micro_batch_metrics.update(
                         {

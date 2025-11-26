@@ -384,7 +384,7 @@ class vLLMRollout(BaseRollout):
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
-                "temperature": max(float(self.config.val_kwargs.temperature), 1e-5) if deterministic else self.config.val_kwargs.temperature,
+                "temperature": max(float(self.config.val_kwargs.temperature), 1e-5),
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
