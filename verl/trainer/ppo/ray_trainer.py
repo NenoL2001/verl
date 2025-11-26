@@ -1145,11 +1145,6 @@ class RayPPOTrainer:
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
-                            if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
-
-                                metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
