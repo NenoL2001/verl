@@ -274,7 +274,6 @@ class vLLMRollout(BaseRollout):
             if hasattr(SamplingParams(), str(k)) and k != "seed":
                 kwargs[k] = config.get(k)
         kwargs["n"] = 1  # already repeat in ray_trainer
-        print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
         rollout_seed = config.get("seed", None)
         if rollout_seed is not None:
@@ -380,7 +379,6 @@ class vLLMRollout(BaseRollout):
                 "n": 1,  # if greedy, only 1 response
             }
         elif is_validate:
-            # TODO: try **
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
@@ -397,7 +395,6 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
-        # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             if rng_seed is not None:
                 seed_int = int(rng_seed)
