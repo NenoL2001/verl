@@ -575,6 +575,7 @@ class RayPPOTrainer:
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "temperature": self.config.actor_rollout_ref.rollout.val_kwargs.temperature,
                 "validate": True,
                 "global_steps": self.global_steps,
             }

@@ -243,7 +243,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor:
             tp_size = rollout_cfg.get("tensor_model_parallel_size", 1) if isinstance(rollout_cfg, dict) else 1
             self.actor_layout = build_parallel_layout(self.config.actor, tp_size=tp_size)
-            normalize_actor_batches(self.config.actor, self.config.rollout.n, self.actor_layout.dp_size)
+            normalize_actor_batches(
+                self.config.actor, self.config.rollout.n, self.actor_layout.dp_size, sp_size=self.actor_layout.sp_size
+            )
             self.actor_ulysses_sequence_parallel_size = self.actor_layout.sp_size
             self.ulysses_sequence_parallel_size = self.actor_layout.sp_size  # backward compat
             self._register_dispatch_collect_info(
@@ -451,7 +453,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             sp_size = layout.sp_size if layout is not None else 1
             per_rank_mini = self.config.actor.ppo_mini_batch_size
             micro_bsz = self.config.actor.get("ppo_micro_batch_size_per_gpu", 1) or 1
-            ds_grad_accum = max(1, per_rank_mini // (micro_bsz * sp_size))
+            # micro_bsz 已在归一化时按 sp_size 缩过，这里不再除 sp，保证 GAS 与 micro_batches 数一致
+            ds_grad_accum = max(1, per_rank_mini // micro_bsz)
             ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * world_size)
 
             if self.rank == 0:
@@ -1246,7 +1249,7 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
 
                     # Vanilla/GSP0/GPG interfaces expect optional `rollout_is_weights`.
                     # We do not compute off-policy weights here; pass None by default.
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                    policy_loss_out = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -1255,6 +1258,26 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                         config=self.config,
                         rollout_is_weights=None,
                     )
+
+                    if (
+                        isinstance(policy_loss_out, tuple)
+                        and len(policy_loss_out) == 2
+                        and isinstance(policy_loss_out[1], dict)
+                    ):
+                        pg_loss, pg_metrics = policy_loss_out
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_out
+                        pg_metrics = {
+                            "actor/pg_clipfrac": pg_clipfrac,
+                            "actor/ppo_kl": ppo_kl,
+                            "actor/pg_clipfrac_lower": pg_clipfrac_lower,
+                        }
+
+                    # Normalize metric values for logging
+                    pg_metrics = {
+                        k: (v.detach().item() if torch.is_tensor(v) else float(v))
+                        for k, v in pg_metrics.items()
+                    }
 
                     # Diagnostic print to catch NaNs early
                     def _stat(x):
@@ -1315,21 +1338,18 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                     micro_batch_metrics.update(
                         {
                             "actor/pg_loss": pg_loss.detach().item() * metric_scale_factor,
-                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                            "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
+                    micro_batch_metrics.update(pg_metrics)
                     append_to_dict(metrics, micro_batch_metrics)
 
-                # Manual gradient clipping (required for bf16 mode)
-                # DeepSpeed's gradient_clipping config doesn't work with bf16
+                # Manual gradient clipping on local parameters (fallback for older DeepSpeed)
                 grad_norm_val = torch.nn.utils.clip_grad_norm_(
                     self.actor_module.parameters(),
                     max_norm=self.config.grad_clip,
                     norm_type=2.0
                 )
-                append_to_dict(metrics, {"actor/grad_norm": float(grad_norm_val)})
+                append_to_dict(metrics, {"actor/grad_norm": grad_norm_val})
 
                 # Step only once after all micro batches
                 self.deepspeed_engine.step()
@@ -1439,14 +1459,13 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
                     }
                     append_to_dict(metrics, micro_batch_metrics)
 
-                # Manual gradient clipping (required for bf16 mode)
-                # DeepSpeed's gradient_clipping config doesn't work with bf16
+                # Manual gradient clipping on local parameters (fallback for older DeepSpeed)
                 grad_norm_val = torch.nn.utils.clip_grad_norm_(
                     self.critic_module.parameters(),
                     max_norm=self.config.grad_clip,
                     norm_type=2.0
                 )
-                append_to_dict(metrics, {"critic/grad_norm": float(grad_norm_val)})
+                append_to_dict(metrics, {"critic/grad_norm": grad_norm_val})
 
                 # Step only once after all micro batches
                 self.deepspeed_engine.step()
@@ -1497,7 +1516,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         self._lora_rank = getattr(self.config.model, "lora_rank", 0)
         self._is_lora = self._lora_rank > 0
 
-        normalize_critic_batches(self.config, self.layout.dp_size)
+        normalize_critic_batches(self.config, self.layout.dp_size, sp_size=self.layout.sp_size)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -1630,7 +1649,8 @@ class CriticWorker(Worker, DistProfilerExtension):
         sp_size = self.layout.sp_size if self.layout is not None else 1
         per_rank_mini = self.config.ppo_mini_batch_size
         micro_bsz = self.config.get("ppo_micro_batch_size_per_gpu", 1) or 1
-        ds_grad_accum = max(1, per_rank_mini // (micro_bsz * sp_size))
+        # micro_bsz 已按 sp_size 归一，这里不再除 sp，保持 GAS 与 micro batch 数一致
+        ds_grad_accum = max(1, per_rank_mini // micro_bsz)
         ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * world_size)
 
         if self.rank == 0:
