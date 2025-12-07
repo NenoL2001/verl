@@ -1216,6 +1216,13 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
         for _ in range(self.config.ppo_epochs):
             for mini_batch in mini_batches:
                 grad_accum_steps = self._get_grad_accum_steps()
+                sp_factor = max(1, self.ulysses_sequence_parallel_size)
+                if torch.distributed.get_rank() == 0:
+                    dp_sz = torch.distributed.get_world_size() // sp_factor if torch.distributed.is_initialized() else 1
+                    print(
+                        f"[ds-actor-scale] sp={sp_factor}, dp={dp_sz}, grad_accum={grad_accum_steps}, "
+                        f"sp_loss_divisor=1.0, use_sp_loss_scale=False"
+                    )
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -1327,7 +1334,8 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                     # Let DeepSpeed handle loss scaling and gradient accumulation
                     is_last_micro = idx == len(micro_batches) - 1
                     self.deepspeed_engine.set_gradient_accumulation_boundary(is_last_micro)
-                    self.deepspeed_engine.backward(policy_loss, scale_wrt_gas=True)
+                    scaled_loss = policy_loss * sp_factor
+                    self.deepspeed_engine.backward(scaled_loss, scale_wrt_gas=True)
 
                     # Collect metrics (loss will be properly scaled for logging)
                     if self.config.use_dynamic_bsz:
@@ -1338,17 +1346,31 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                     micro_batch_metrics.update(
                         {
                             "actor/pg_loss": pg_loss.detach().item() * metric_scale_factor,
+                            "actor/grad_accum_steps": float(grad_accum_steps),
+                            "actor/sp_size": float(sp_factor),
+                            "actor/dp_size": float(dp_sz if 'dp_sz' in locals() else 1),
+                            "actor/micro_batches_per_step": float(len(micro_batches)),
+                            "actor/sp_loss_divisor": 1.0,
                         }
                     )
                     micro_batch_metrics.update(pg_metrics)
                     append_to_dict(metrics, micro_batch_metrics)
 
-                # Manual gradient clipping on local parameters (fallback for older DeepSpeed)
-                grad_norm_val = torch.nn.utils.clip_grad_norm_(
-                    self.actor_module.parameters(),
-                    max_norm=self.config.grad_clip,
-                    norm_type=2.0
-                )
+                # Prefer DeepSpeed global grad norm when ZeRO is active; otherwise fall back to local clip.
+                ds_zero = getattr(self.config, "zero_stage", 0)
+                if ds_zero and hasattr(self.deepspeed_engine, "get_global_grad_norm"):
+                    try:
+                        grad_norm_val = float(self.deepspeed_engine.get_global_grad_norm())
+                    except Exception:
+                        grad_norm_val = 0.0
+                else:
+                    grad_norm_val = float(
+                        torch.nn.utils.clip_grad_norm_(
+                            self.actor_module.parameters(),
+                            max_norm=self.config.grad_clip,
+                            norm_type=2.0,
+                        )
+                    )
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm_val})
 
                 # Step only once after all micro batches
@@ -1417,6 +1439,13 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                sp_factor = max(1, self.ulysses_sequence_parallel_size)
+                if torch.distributed.get_rank() == 0:
+                    world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+                    print(
+                        f"[ds-critic-scale] sp={sp_factor}, dp={world // sp_factor}, "
+                        f"grad_accum={grad_accum_steps}, sp_loss_divisor=1.0, use_sp_loss_scale=False"
+                    )
 
                 if self._use_manual_backward:
                     self.critic_optimizer.zero_grad()
@@ -1432,14 +1461,37 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
 
                     vpreds = self._forward_micro_batch(model_inputs)
 
-                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                        vpreds=vpreds,
-                        values=values,
-                        returns=returns,
-                        response_mask=response_mask,
-                        cliprange_value=self.config.cliprange_value,
-                        loss_agg_mode=self.config.loss_agg_mode,
+                    # ----- SP-aware loss aggregation -----
+                    vpredclipped = verl_F.clip_by_value(
+                        vpreds, values - self.config.cliprange_value, values + self.config.cliprange_value
                     )
+                    vf_losses1 = (vpreds - returns) ** 2
+                    vf_losses2 = (vpredclipped - returns) ** 2
+                    clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
+
+                    token_sum = torch.nan_to_num(response_mask.sum(), nan=0.0)
+                    loss_sum = torch.nan_to_num((clipped_vf_losses * response_mask).sum(), nan=0.0)
+                    clip_used = torch.gt(vf_losses2, vf_losses1).float()
+                    clip_used_sum = torch.nan_to_num((clip_used * response_mask).sum(), nan=0.0)
+                    vpred_sum = torch.nan_to_num((vpreds * response_mask).sum(), nan=0.0)
+
+                    sp_group = get_ulysses_sequence_parallel_group()
+                    if sp_group is not None and sp_factor > 1:
+                        for t in (token_sum, loss_sum, clip_used_sum, vpred_sum):
+                            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM, group=sp_group)
+
+                    global_token_sum = token_sum.clamp_min(1.0)
+                    dp_size = max(
+                        1,
+                        (torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1) // sp_factor,
+                    )
+                    vf_loss = 0.5 * (loss_sum / global_token_sum) * dp_size
+                    vf_clipfrac = (clip_used_sum / global_token_sum)
+                    vpred_mean_global = (vpred_sum / global_token_sum).detach().item()
+                    vpred_std = torch.nan_to_num(vpreds.float().std(), nan=0.0).item()
+                    returns_std = torch.nan_to_num(returns.float().std(), nan=0.0).item()
+                    per_token_mse = loss_sum / global_token_sum
+                    per_token_rmse = torch.sqrt(torch.nan_to_num(per_token_mse, nan=0.0)).item()
 
                     # Let DeepSpeed handle loss scaling and gradient accumulation
                     is_last_micro = idx == len(micro_batches) - 1
@@ -1455,16 +1507,38 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
                     micro_batch_metrics = {
                         "critic/vf_loss": vf_loss.detach().item() * metric_scale_factor,
                         "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-                        "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+                        "critic/vpred_mean": vpred_mean_global,
+                        "critic/vpred_std": vpred_std,
+                        "critic/returns_std": returns_std,
+                        "critic/num_tokens": global_token_sum.detach().item(),
+                        "critic/rmse_per_token": per_token_rmse,
+                        "critic/grad_accum_steps": grad_accum_steps,
+                        "critic/sp_size": sp_factor,
+                        "critic/dp_size": max(
+                            1,
+                            (torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1)
+                            // sp_factor,
+                        ),
+                        "critic/micro_batches_per_step": len(micro_batches),
+                        "critic/sp_loss_divisor": 1.0,
                     }
                     append_to_dict(metrics, micro_batch_metrics)
 
-                # Manual gradient clipping on local parameters (fallback for older DeepSpeed)
-                grad_norm_val = torch.nn.utils.clip_grad_norm_(
-                    self.critic_module.parameters(),
-                    max_norm=self.config.grad_clip,
-                    norm_type=2.0
-                )
+                # Prefer DeepSpeed global grad norm when ZeRO is active; otherwise fall back to local clip.
+                ds_zero = getattr(self.config, "zero_stage", 0)
+                if ds_zero and hasattr(self.deepspeed_engine, "get_global_grad_norm"):
+                    try:
+                        grad_norm_val = float(self.deepspeed_engine.get_global_grad_norm())
+                    except Exception:
+                        grad_norm_val = 0.0
+                else:
+                    grad_norm_val = float(
+                        torch.nn.utils.clip_grad_norm_(
+                            self.critic_module.parameters(),
+                            max_norm=self.config.grad_clip,
+                            norm_type=2.0,
+                        )
+                    )
                 append_to_dict(metrics, {"critic/grad_norm": grad_norm_val})
 
                 # Step only once after all micro batches
