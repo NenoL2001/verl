@@ -1325,8 +1325,8 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                     # Let DeepSpeed handle loss scaling and gradient accumulation
                     is_last_micro = idx == len(micro_batches) - 1
                     self.deepspeed_engine.set_gradient_accumulation_boundary(is_last_micro)
-                    scaled_loss = policy_loss * sp_factor
-                    self.deepspeed_engine.backward(scaled_loss, scale_wrt_gas=True)
+                    # Keep parity with FSDP: avoid extra sp scaling on the loss
+                    self.deepspeed_engine.backward(policy_loss, scale_wrt_gas=True)
 
                     # Collect metrics (loss will be properly scaled for logging)
                     if self.config.use_dynamic_bsz:
