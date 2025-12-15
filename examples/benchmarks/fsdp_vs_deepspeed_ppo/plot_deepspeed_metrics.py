@@ -64,11 +64,12 @@ def plot_metrics(run_dfs: Dict[str, pd.DataFrame], outdir: Path) -> None:
     metrics = [
         ("perf/throughput", "Throughput (tokens/s)"),
         ("perf/max_memory_reserved_gb", "Max Memory Reserved (GB)"),
+        ("perf/max_memory_allocated_gb", "Max Memory Allocated (GB)"),
         ("actor/pg_loss", "Actor PG Loss"),
         ("critic/vf_loss", "Critic VF Loss"),
         ("critic/rewards/mean", "Rewards Mean"),
     ]
-    fig, axes = plt.subplots(len(metrics), 1, figsize=(10, 12), sharex=True)
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(10, 14), sharex=True)
     for ax, (key, title) in zip(axes, metrics):
         for name, df in run_dfs.items():
             if key not in df:
@@ -114,15 +115,15 @@ def main():
             continue
         name = path.stem
         run_dfs[name] = df
-        csv_path = outdir / f\"{name}.csv\"
+        csv_path = outdir / f"{name}.csv"
         df.to_csv(csv_path, index=False)
-        print(f\"[parse] {path} -> {csv_path} ({len(df)} rows)\")
+        print(f"[parse] {path} -> {csv_path} ({len(df)} rows)")
 
     if run_dfs:
         plot_metrics(run_dfs, outdir)
     else:
-        print(\"[warn] nothing to plot.\")
+        print("[warn] nothing to plot.")
 
 
-if __name__ == \"__main__\":
+if __name__ == "__main__":
     main()
