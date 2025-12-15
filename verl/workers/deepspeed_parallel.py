@@ -27,7 +27,6 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass
 from typing import Any
-import os
 
 import torch.distributed as dist
 
@@ -122,18 +121,26 @@ def build_parallel_layout(role_cfg: Any, tp_size: int = 1) -> ParallelLayout:
 
 def normalize_actor_batches(actor_cfg: Any, rollout_n: int, dp_size: int, sp_size: int = 1):
     """
-    Normalize actor batch config to per-DP-rank values (match FSDP semantics).
-    Scale mini batch size by DP/SP; only scale micro if a global micro size is provided.
+    Normalize actor batch config to per-DP-rank values.
     """
     actor_cfg.ppo_mini_batch_size *= rollout_n
-    actor_cfg.ppo_mini_batch_size //= max(1, dp_size)
+    actor_cfg.ppo_mini_batch_size //= dp_size
     if actor_cfg.ppo_mini_batch_size <= 0:
         raise ValueError(f"Normalized actor ppo_mini_batch_size {actor_cfg.ppo_mini_batch_size} must be > 0")
 
-    # Match FSDP: only normalize micro batch when a global micro size is supplied.
-    if getattr(actor_cfg, "ppo_micro_batch_size", None) is not None:
-        actor_cfg.ppo_micro_batch_size //= max(1, dp_size)
-        actor_cfg.ppo_micro_batch_size_per_gpu = actor_cfg.ppo_micro_batch_size
+    derived_from_mbs = False
+    if actor_cfg.ppo_micro_batch_size is not None:
+        micro = actor_cfg.ppo_micro_batch_size // dp_size
+        if micro <= 0:
+            raise ValueError(
+                f"actor.ppo_micro_batch_size becomes {micro} after normalization (dp={dp_size})"
+            )
+        actor_cfg.ppo_micro_batch_size = micro
+        actor_cfg.ppo_micro_batch_size_per_gpu = micro
+        derived_from_mbs = True
+
+    if actor_cfg.ppo_micro_batch_size_per_gpu is not None and not derived_from_mbs:
+        micro = actor_cfg.ppo_micro_batch_size_per_gpu
 
     if actor_cfg.ppo_micro_batch_size_per_gpu is not None:
         assert actor_cfg.ppo_mini_batch_size % actor_cfg.ppo_micro_batch_size_per_gpu == 0, (
@@ -141,34 +148,31 @@ def normalize_actor_batches(actor_cfg: Any, rollout_n: int, dp_size: int, sp_siz
             f"ppo_micro_batch_size_per_gpu {actor_cfg.ppo_micro_batch_size_per_gpu}"
         )
 
+
 def normalize_critic_batches(critic_cfg: Any, dp_size: int, sp_size: int = 1):
     """
-    Normalize critic batch config to per-DP-rank values (match FSDP semantics).
-    Scale mini batch size by DP/SP; only scale micro if a global micro size is provided.
+    Normalize critic batch config to per-DP-rank values.
     """
-    cfg_debug = bool(int(os.getenv("PARITY_CFG_DEBUG", "0")))
-    if cfg_debug:
-        print(
-            f"[cfg-debug][critic] before normalize: mini={critic_cfg.ppo_mini_batch_size}, "
-            f"micro={getattr(critic_cfg, 'ppo_micro_batch_size', None)}, "
-            f"micro_per_gpu={getattr(critic_cfg, 'ppo_micro_batch_size_per_gpu', None)}, "
-            f"dp_size={dp_size}, sp_size={sp_size}"
-        )
-    critic_cfg.ppo_mini_batch_size //= max(1, dp_size)
+    critic_cfg.ppo_mini_batch_size //= dp_size
     if critic_cfg.ppo_mini_batch_size <= 0:
         raise ValueError(f"Normalized critic ppo_mini_batch_size {critic_cfg.ppo_mini_batch_size} must be > 0")
 
+    derived_from_mbs = False
     if getattr(critic_cfg, "ppo_micro_batch_size", None) is not None:
-        critic_cfg.ppo_micro_batch_size //= max(1, dp_size)
-        critic_cfg.ppo_micro_batch_size_per_gpu = critic_cfg.ppo_micro_batch_size
+        micro = critic_cfg.ppo_micro_batch_size // dp_size
+        if micro <= 0:
+            raise ValueError(
+                f"critic.ppo_micro_batch_size becomes {micro} after normalization (dp={dp_size})"
+            )
+        critic_cfg.ppo_micro_batch_size = micro
+        critic_cfg.ppo_micro_batch_size_per_gpu = micro
+        derived_from_mbs = True
+
+    if critic_cfg.ppo_micro_batch_size_per_gpu is not None and not derived_from_mbs:
+        micro = critic_cfg.ppo_micro_batch_size_per_gpu
 
     if critic_cfg.ppo_micro_batch_size_per_gpu is not None:
         assert critic_cfg.ppo_mini_batch_size % critic_cfg.ppo_micro_batch_size_per_gpu == 0, (
             f"normalized ppo_mini_batch_size {critic_cfg.ppo_mini_batch_size} must be divisible by "
             f"ppo_micro_batch_size_per_gpu {critic_cfg.ppo_micro_batch_size_per_gpu}"
-        )
-    if cfg_debug:
-        print(
-            f"[cfg-debug][critic] after normalize: mini={critic_cfg.ppo_mini_batch_size}, "
-            f"micro_per_gpu={critic_cfg.ppo_micro_batch_size_per_gpu}, dp_size={dp_size}, sp_size={sp_size}"
         )
