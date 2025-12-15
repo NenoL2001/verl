@@ -448,11 +448,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
             )
             sp_size = layout.sp_size if layout is not None else 1
-            per_rank_mini = self.config.actor.ppo_mini_batch_size
+            per_rank_mini = max(1, self.config.actor.ppo_mini_batch_size // max(1, dp_size))
             micro_bsz = self.config.actor.get("ppo_micro_batch_size_per_gpu", 1) or 1
             # micro_bsz 已在归一化时按 sp_size 缩过，这里不再除 sp，保证 GAS 与 micro_batches 数一致
             ds_grad_accum = max(1, per_rank_mini // micro_bsz)
-            # train_batch_size 仅随 DP 缩放，保持与 FSDP 定义一致（micro * GAS * dp_size）
             ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size)
 
             ds_config = get_deepspeed_config(
@@ -473,11 +472,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
             # Initialize DeepSpeed engine
+                # Initialize DeepSpeed engine without optimizer
+            tempWorldSize = ds_config.get("world_size", 1)
+            ds_config["world_size"] = ds_config.get("dp_size", 1)
             ds_engine, optimizer, _, lr_scheduler = initialize_deepspeed_engine(
                 model=actor_module,
                 config=ds_config,
                 model_parameters=actor_module.parameters(),
             )
+            ds_config["world_size"] = tempWorldSize
+
 
             return ds_engine, ds_engine.module, optimizer, lr_scheduler, actor_model_config
         else:
@@ -1709,11 +1713,11 @@ class CriticWorker(Worker, DistProfilerExtension):
             torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         )
         sp_size = self.layout.sp_size if self.layout is not None else 1
-        per_rank_mini = self.config.ppo_mini_batch_size
+        per_rank_mini = max(1, self.config.ppo_mini_batch_size // max(1, dp_size))
         micro_bsz = self.config.get("ppo_micro_batch_size_per_gpu", 1) or 1
         # micro_bsz 已按 sp_size 归一，这里不再除 sp，保持 GAS 与 micro batch 数一致
         ds_grad_accum = max(1, per_rank_mini // micro_bsz)
-        # train_batch_size 仅随 DP 缩放，保持与 FSDP 定义一致（micro * GAS * dp_size）
+        # DeepSpeed asserts train_batch_size against global world_size (dp * sp); scale by sp_size to satisfy it
         ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size)
 
         ds_config = get_deepspeed_config(
@@ -1731,12 +1735,17 @@ class CriticWorker(Worker, DistProfilerExtension):
             offload_optimizer=self.config.deepspeed_config.get("optimizer_offload", False),
             gradient_clipping=self.config.get("grad_clip", None),
         )
-
+        
+        
+        tempWorldSize = ds_config.get("world_size", 1)
+        ds_config["world_size"] = ds_config.get("dp_size", 1) 
         self.critic_engine, optimizer, _, lr_scheduler = initialize_deepspeed_engine(
             model=critic_module,
             config=ds_config,
             model_parameters=critic_module.parameters(),
         )
+        ds_config["world_size"] = tempWorldSize
+
 
         self.critic_module = self.critic_engine.module
         self.critic_optimizer = optimizer
@@ -2045,11 +2054,14 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             del ds_config["optimizer"]
 
         # Initialize DeepSpeed engine without optimizer
+        tempWorldSize = ds_config.get("world_size", 1)
+        ds_config["world_size"] = ds_config.get("dp_size", 1)
         ds_engine, _, _, _ = initialize_deepspeed_engine(
             model=reward_module,
             config=ds_config,
             model_parameters=None,  # No parameters needed for inference
         )
+        ds_config["world_size"] = tempWorldSize
 
         return ds_engine
 
