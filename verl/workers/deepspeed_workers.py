@@ -447,9 +447,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             dp_size = layout.dp_size if layout is not None else (
                 torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
             )
-            world_size = layout.world_size if layout is not None else (
-                torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-            )
             sp_size = layout.sp_size if layout is not None else 1
             per_rank_mini = self.config.actor.ppo_mini_batch_size
             micro_bsz = self.config.actor.get("ppo_micro_batch_size_per_gpu", 1) or 1
@@ -457,13 +454,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ds_grad_accum = max(1, per_rank_mini // micro_bsz)
             # train_batch_size 仅随 DP 缩放，保持与 FSDP 定义一致（micro * GAS * dp_size）
             ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size)
-
-            if self.rank == 0:
-                print(
-                    f"[ds-actor-config] sp_size={sp_size}, dp_size={dp_size}, world_size={world_size}, "
-                    f"per_rank_mini={per_rank_mini}, micro_bsz={micro_bsz}, grad_accum={ds_grad_accum}, "
-                    f"train_batch_size={ds_train_batch_size}"
-                )
 
             ds_config = get_deepspeed_config(
                 optimizer_type=optim_config.get("optimizer", "AdamW"),
@@ -1718,9 +1708,6 @@ class CriticWorker(Worker, DistProfilerExtension):
         dp_size = self.layout.dp_size if self.layout is not None else (
             torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         )
-        world_size = self.layout.world_size if self.layout is not None else (
-            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        )
         sp_size = self.layout.sp_size if self.layout is not None else 1
         per_rank_mini = self.config.ppo_mini_batch_size
         micro_bsz = self.config.get("ppo_micro_batch_size_per_gpu", 1) or 1
@@ -1728,13 +1715,6 @@ class CriticWorker(Worker, DistProfilerExtension):
         ds_grad_accum = max(1, per_rank_mini // micro_bsz)
         # train_batch_size 仅随 DP 缩放，保持与 FSDP 定义一致（micro * GAS * dp_size）
         ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size)
-
-        if self.rank == 0:
-            print(
-                f"[ds-critic-config] sp_size={sp_size}, dp_size={dp_size}, world_size={world_size}, "
-                f"per_rank_mini={per_rank_mini}, micro_bsz={micro_bsz}, grad_accum={ds_grad_accum}, "
-                f"train_batch_size={ds_train_batch_size}"
-            )
 
         ds_config = get_deepspeed_config(
             optimizer_type=self.config.optim.get("optimizer", "AdamW"),
