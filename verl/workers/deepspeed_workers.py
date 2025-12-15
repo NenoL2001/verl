@@ -455,7 +455,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             micro_bsz = self.config.actor.get("ppo_micro_batch_size_per_gpu", 1) or 1
             # micro_bsz 已在归一化时按 sp_size 缩过，这里不再除 sp，保证 GAS 与 micro_batches 数一致
             ds_grad_accum = max(1, per_rank_mini // micro_bsz)
-            ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * world_size)
+            # train_batch_size 仅随 DP 缩放，保持与 FSDP 定义一致（micro * GAS * dp_size）
+            ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size)
 
             if self.rank == 0:
                 print(
@@ -1725,7 +1726,8 @@ class CriticWorker(Worker, DistProfilerExtension):
         micro_bsz = self.config.get("ppo_micro_batch_size_per_gpu", 1) or 1
         # micro_bsz 已按 sp_size 归一，这里不再除 sp，保持 GAS 与 micro batch 数一致
         ds_grad_accum = max(1, per_rank_mini // micro_bsz)
-        ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * world_size)
+        # train_batch_size 仅随 DP 缩放，保持与 FSDP 定义一致（micro * GAS * dp_size）
+        ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size)
 
         if self.rank == 0:
             print(
