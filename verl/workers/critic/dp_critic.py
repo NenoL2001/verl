@@ -17,6 +17,9 @@ Implement a multiprocess PPOCritic
 
 import logging
 import os
+import hashlib
+from contextlib import nullcontext
+from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed
@@ -38,6 +41,56 @@ from verl.workers.critic import BasePPOCritic
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+PROBE_NAMES: Tuple[str, ...] = (
+    "model.embed_tokens.weight",
+    "lm_head.weight",
+    "v_head.weight",
+    "value_head.weight",
+    "model.layers.0.self_attn.q_proj.weight",
+    "model.layers.0.self_attn.k_proj.weight",
+    "model.layers.0.self_attn.v_proj.weight",
+    "model.layers.0.self_attn.o_proj.weight",
+    "model.layers.0.mlp.gate_proj.weight",
+)
+
+
+def _hash_tensor(t: torch.Tensor) -> str:
+    try:
+        return hashlib.sha256(t.detach().cpu().numpy().tobytes()).hexdigest()
+    except Exception:
+        return "NA"
+
+
+def _flatten_slice(t: torch.Tensor, limit: int = 4096) -> torch.Tensor:
+    return t.detach().float().reshape(-1)[:limit].cpu()
+
+
+def _should_dump(meta: Dict) -> bool:
+    if not meta:
+        return False
+    return str(meta.get("parity_dump", "0")) == "1"
+
+
+def _step_enabled(meta: Dict, step_id: int) -> bool:
+    if not _should_dump(meta):
+        return False
+    raw = str(meta.get("parity_dump_steps", "0"))
+    try:
+        steps = {int(x.strip()) for x in raw.split(",") if x.strip() != ""}
+    except Exception:
+        steps = {0}
+    return step_id in steps
+
+
+def _dump_debug(out_dir: str, impl: str, step_id: int, tag: str, payload: Dict):
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    if not out_dir:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"debug_rank0_step{step_id}_{tag}.pt")
+    torch.save(payload, path)
+
 
 class DataParallelPPOCritic(BasePPOCritic):
     def __init__(self, config, critic_module: nn.Module, critic_optimizer: optim.Optimizer):
@@ -49,6 +102,29 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
+
+    def _probe_params(self) -> Dict[str, nn.Parameter]:
+        probes = {}
+        for name, p in self.critic_module.named_parameters():
+            norm_name = name.replace("_fsdp_wrapped_module.", "")
+            if norm_name in PROBE_NAMES and p.requires_grad:
+                probes[norm_name] = p
+        return probes
+
+    def _attach_grad_hooks(self, probes: Dict[str, nn.Parameter], store: Dict[str, torch.Tensor]) -> List:
+        hooks: List = []
+
+        def _make(name):
+            def fn(grad):
+                store[name] = _flatten_slice(grad)
+
+            return fn
+
+        for n, p in probes.items():
+            if p.grad_fn is None and not p.requires_grad:
+                continue
+            hooks.append(p.register_hook(_make(n)))
+        return hooks
 
     def _forward_micro_batch(self, micro_batch):
         response_length = micro_batch["responses"].size(-1)
@@ -192,7 +268,34 @@ class DataParallelPPOCritic(BasePPOCritic):
     def update_critic(self, data: DataProto):
         # make sure we are in training mode
         self.critic_module.train()
+
+        # Align RNG with DS parity runs if provided in meta.
+        if isinstance(data.meta_info, dict) and "rng_seed" in data.meta_info:
+            rng_seed = data.meta_info["rng_seed"]
+            if torch.distributed.get_rank() == 0:
+                print(f"[FSDP Critic] Setting RNG seed: {rng_seed}")
+            torch.manual_seed(rng_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(rng_seed)
         metrics = {}
+        loss_debug = bool(int(os.getenv("PARITY_FSDP_LOSS_DEBUG", "0")))
+        meta = data.meta_info
+        impl = meta.get("impl", "fsdp") if isinstance(meta, dict) else "fsdp"
+        step_id = int(meta.get("step_id", 0)) if isinstance(meta, dict) else 0
+        out_dir = meta.get("parity_out_dir") if isinstance(meta, dict) else None
+        dump_this_step = _step_enabled(meta, step_id) if isinstance(meta, dict) else False
+        probe_pre = {}
+        probe_grad: Dict[str, torch.Tensor] = {}
+        probe_hooks: List = []
+        input_dump = {}
+        probes = {}
+        if dump_this_step:
+            # capture small slices of inputs for first micro-batch later
+            probes = self._probe_params()
+            for name, p in probes.items():
+                probe_pre[name] = _flatten_slice(p)
+            probe_hooks = self._attach_grad_hooks(probes, probe_grad)
+            _dump_debug(out_dir, impl, step_id, "pre_fwd", {"probe_pre": probe_pre})
 
         select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -214,16 +317,40 @@ class DataParallelPPOCritic(BasePPOCritic):
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                    any_tensor = next(iter(mini_batch.batch.values()))
+                    actual_mini = any_tensor.shape[0]
+                    print(
+                        f"[fsdp-critic-batch] mini={actual_mini}, config_mini={self.config.ppo_mini_batch_size}, "
+                        f"micro_bsz={self.config.ppo_micro_batch_size_per_gpu}, "
+                        f"micro_batches={len(micro_batches)}, grad_accum={self.gradient_accumulation}"
+                    )
+                micro_batch_count = len(micro_batches)
 
                 self.critic_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     values = model_inputs["values"]
                     returns = model_inputs["returns"]
+
+                    if dump_this_step and not input_dump:
+                        # record a small snapshot of inputs
+                        input_dump = {
+                            "input_ids": model_inputs["input_ids"][:2, :16].detach().cpu(),
+                            "responses": model_inputs["responses"][:2, :16].detach().cpu(),
+                            "attention_mask": model_inputs["attention_mask"][:2, :16].detach().cpu(),
+                            "position_ids": model_inputs["position_ids"][:2, :16].detach().cpu(),
+                            "values": values[:2, :16].detach().cpu(),
+                            "returns": returns[:2, :16].detach().cpu(),
+                            "response_mask": response_mask[:2, :16].detach().cpu(),
+                            "hash_input_ids": _hash_tensor(model_inputs["input_ids"]),
+                            "hash_attention_mask": _hash_tensor(model_inputs["attention_mask"]),
+                            "hash_position_ids": _hash_tensor(model_inputs["position_ids"]),
+                        }
 
                     vpreds = self._forward_micro_batch(model_inputs)
                     vf_loss, vf_clipfrac = core_algos.compute_value_loss(
@@ -242,20 +369,88 @@ class DataParallelPPOCritic(BasePPOCritic):
                         loss_scale_factor = 1 / self.gradient_accumulation
                         loss = vf_loss * loss_scale_factor
 
+                    if loss_debug and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+                        print(
+                            f"[fsdp-critic-loss-debug] batch_idx={batch_idx}, micro_idx={micro_idx}, "
+                            f"grad_accum={self.gradient_accumulation}, "
+                            f"token_sum={float(response_mask.sum().detach().cpu())}, "
+                            f"vf_loss={float(vf_loss.detach().cpu())}, "
+                            f"loss_scale_factor={loss_scale_factor}, "
+                            f"loss_for_backward={float(loss.detach().cpu())}"
+                        )
+
                     loss.backward()
+
+                    if dump_this_step and not micro_batch_metrics.get("debug/post_fwd"):
+                        micro_batch_metrics["debug/post_fwd"] = {
+                            "vpreds": vpreds[:2, :16].detach().cpu(),
+                            "vf_loss": vf_loss.detach().cpu(),
+                            "loss": loss.detach().cpu(),
+                            "loss_scale_factor": loss_scale_factor,
+                            "returns": returns[:2, :16].detach().cpu(),
+                        }
 
                     micro_batch_metrics.update(
                         {
                             "critic/vf_loss": vf_loss.detach().item() * loss_scale_factor,
                             "critic/vf_clipfrac": vf_clipfrac.detach().item(),
                             "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+                            "critic/token_sum_local": float(response_mask.sum().detach().cpu()),
+                            "critic/per_token_mse_raw": float(
+                                torch.nan_to_num(((vpreds - returns) ** 2 * response_mask).sum(), nan=0.0)
+                                / max(1.0, float(response_mask.sum().detach().cpu()))
+                            ),
+                            "critic/grad_accum_steps": float(self.gradient_accumulation),
+                            "critic/loss_scale_factor": float(loss_scale_factor),
+                            "critic/loss_unscaled": float(vf_loss.detach().cpu()),
+                            "critic/loss_for_backward": float(loss.detach().cpu()),
+                            "critic/vpreds_slice": vpreds[:2, :16].detach().cpu(),
+                            "critic/returns_slice": returns[:2, :16].detach().cpu(),
                         }
                     )
 
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"critic/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, mini_batch_metrics)
+            grad_norm = self._optimizer_step()
+            mini_batch_metrics = {
+                "critic/grad_norm": grad_norm.detach().item(),
+                "critic/micro_batches_per_step": float(micro_batch_count),
+            }
+            append_to_dict(metrics, mini_batch_metrics)
+            if dump_this_step:
+                # ensure gradients captured even if hooks missed
+                if not probe_grad and probes:
+                    for n, p in probes.items():
+                        if p.grad is not None:
+                            probe_grad[n] = _flatten_slice(p.grad)
+                post_fwd_payload = micro_batch_metrics.get("debug/post_fwd", {})
+                if input_dump:
+                    post_fwd_payload.update({"inputs": input_dump})
+                _dump_debug(out_dir, impl, step_id, "post_fwd_pre_bwd", post_fwd_payload)
+                post_bwd = {
+                    "grad_norm": grad_norm.detach().cpu(),
+                    "grad_store": probe_grad,
+                }
+                _dump_debug(out_dir, impl, step_id, "post_bwd_pre_step", post_bwd)
+            # optimizer step updates params
         self.critic_optimizer.zero_grad()
+        if dump_this_step:
+            post_step = {}
+            probes = self._probe_params()
+            for name, p in probes.items():
+                slice_now = _flatten_slice(p)
+                prev = probe_pre.get(name)
+                delta = slice_now - prev if prev is not None else slice_now
+                post_step[name] = {"param": slice_now, "delta": delta}
+            payload = {
+                "inputs": input_dump,
+                "probe_pre": probe_pre,
+                "probe_grad": probe_grad,
+                "post_step": post_step,
+                "step_id": step_id,
+                "impl": impl,
+            }
+            _dump_debug(out_dir, impl, step_id, "post_step", payload)
+            for h in probe_hooks:
+                h.remove()
         return metrics

@@ -24,7 +24,7 @@ import logging
 import os
 import warnings
 from contextlib import nullcontext
-from typing import Optional
+from typing import Optional, Dict, List, Any, Tuple
 
 import psutil
 import torch
@@ -76,6 +76,7 @@ from verl.workers.deepspeed_parallel import (
     normalize_actor_batches,
     normalize_critic_batches,
 )
+from verl.workers.critic.dp_critic import _hash_tensor, _flatten_slice, _step_enabled, _dump_debug
 from verl.utils.checkpoint.deepspeed_checkpoint_manager import DeepSpeedCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.deepspeed_utils import (
@@ -143,6 +144,23 @@ def _parse_mixed_precision_config(mixed_precision):
         return param_dtype == "fp16", param_dtype == "bf16"
     else:
         return False, False
+
+
+def _derive_ds_batch_params(per_rank_mini: int, micro_bsz: int, dp_size: int) -> Tuple[int, int]:
+    """
+    Match FSDP semantics: per-rank mini/micro are already normalized by DP/SP.
+    Returns (grad_accum_steps, train_batch_size).
+    """
+    if per_rank_mini <= 0 or micro_bsz <= 0:
+        raise ValueError(f"Invalid mini ({per_rank_mini}) or micro ({micro_bsz}) batch size")
+    if per_rank_mini % micro_bsz != 0:
+        raise ValueError(f"per-rank mini {per_rank_mini} must be divisible by micro {micro_bsz}")
+    grad_accum = per_rank_mini // micro_bsz
+    # train_batch_size should only scale with DP (not SP) to mirror FSDP divisor
+    train_batch = micro_bsz * grad_accum * max(1, dp_size)
+    return grad_accum, train_batch
+
+
 
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -451,11 +469,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
             )
             sp_size = layout.sp_size if layout is not None else 1
+            if world_size != max(1, dp_size) * max(1, sp_size):
+                raise AssertionError(f"world_size({world_size}) must equal dp_size({dp_size}) * sp_size({sp_size})")
             per_rank_mini = self.config.actor.ppo_mini_batch_size
             micro_bsz = self.config.actor.get("ppo_micro_batch_size_per_gpu", 1) or 1
-            # micro_bsz 已在归一化时按 sp_size 缩过，这里不再除 sp，保证 GAS 与 micro_batches 数一致
-            ds_grad_accum = max(1, per_rank_mini // micro_bsz)
-            ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * world_size)
+            ds_grad_accum, ds_train_batch_size = _derive_ds_batch_params(per_rank_mini, micro_bsz, dp_size)
+            # Persist into config for downstream logging/debug consistency
+            try:
+                self.config.actor.deepspeed_config["train_batch_size"] = ds_train_batch_size
+                self.config.actor.deepspeed_config["gradient_accumulation_steps"] = ds_grad_accum
+            except Exception:
+                pass
 
             if self.rank == 0:
                 print(
@@ -463,7 +487,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     f"per_rank_mini={per_rank_mini}, micro_bsz={micro_bsz}, grad_accum={ds_grad_accum}, "
                     f"train_batch_size={ds_train_batch_size}"
                 )
+                print(
+                    f"[ds-actor-init] train_batch_size={ds_train_batch_size}, micro_bsz={micro_bsz}, "
+                    f"grad_accum={ds_grad_accum}, ds_config_grad_accum={ds_config.get('gradient_accumulation_steps')}"
+                )
+                print(
+                    f"[ds-actor-init] train_batch_size={ds_train_batch_size}, micro_bsz={micro_bsz}, "
+                    f"grad_accum={ds_grad_accum}, ds_config_grad_accum={ds_config.get('gradient_accumulation_steps')}"
+                )
 
+            python_clip = bool(int(os.getenv("PARITY_DS_PYTHON_CLIP", "0")))
             ds_config = get_deepspeed_config(
                 optimizer_type=optim_config.get("optimizer", "AdamW"),
                 train_batch_size=ds_train_batch_size,
@@ -478,8 +511,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 bf16_enabled=bf16_enabled,
                 cpu_offload=deepspeed_config.get("param_offload", False),
                 offload_optimizer=deepspeed_config.get("optimizer_offload", False),
-                gradient_clipping=self.config.actor.get("grad_clip", None),
+                gradient_clipping=0.0 if python_clip else self.config.actor.get("grad_clip", None),
             )
+            if bool(int(os.getenv("PARITY_DS_TORCH_OPT", "0"))):
+                ds_config["optimizer"]["params"]["torch_adam"] = True
+                ds_config["optimizer"]["params"]["fused"] = False
 
             # Initialize DeepSpeed engine
             ds_engine, optimizer, _, lr_scheduler = initialize_deepspeed_engine(
@@ -1153,8 +1189,14 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
     def __init__(self, config, actor_module, engine):
         super().__init__(config=config, actor_module=actor_module, actor_optimizer=engine.optimizer)
         self.deepspeed_engine = engine
-        self._use_manual_backward = bool(int(os.getenv("DS_USE_MANUAL_BACKWARD", "0")))
+        self._use_manual_backward = False
         self._last_grad_layout: list[tuple[str, int]] = []
+        assert (
+            self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0
+        ), (
+            "ppo_mini_batch_size must be divisible by ppo_micro_batch_size_per_gpu "
+            "and should already be per-rank (same semantics as FSDP)."
+        )
         base_opt = getattr(engine.optimizer, "optimizer", None)
         if torch.distributed.get_rank() == 0:
             print(
@@ -1213,26 +1255,211 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
+        meta = data.meta_info
+        impl = meta.get("impl", "deepspeed") if isinstance(meta, dict) else "deepspeed"
+        step_id = int(meta.get("step_id", 0)) if isinstance(meta, dict) else 0
+        out_dir = meta.get("parity_out_dir") if isinstance(meta, dict) else None
+        dump_this_step = _step_enabled(meta, step_id) if isinstance(meta, dict) else False
+        debug_env = bool(int(os.getenv("PARITY_DS_MINI_DEBUG", "0")))
+        force_zero_grad = bool(int(os.getenv("PARITY_DS_FORCE_ZERO_GRAD", "0")))
+        debug_enabled = dump_this_step or debug_env
+        trace_steps = bool(int(os.getenv("PARITY_DS_TRACE_STEPS", "0")))
+        fp16_bucket_debug = bool(int(os.getenv("PARITY_DS_FP16_BUCKET_DEBUG", "0")))
+        fp16_bucket_clear = bool(int(os.getenv("PARITY_DS_FP16_BUCKET_CLEAR", "0")))
+
+        def _collect_fp16_bucket_stats(opt, label: str) -> Dict[str, Dict[str, float]]:
+            stats: Dict[str, Dict[str, float]] = {}
+            if opt is None:
+                return stats
+            try:
+                buckets = getattr(opt, "fp16_groups_flat", None)
+                if buckets:
+                    for i, buf in enumerate(buckets[:3]):  # limit to first few to avoid heavy cost
+                        if buf is None:
+                            continue
+                        stats[f"{label}_fp16_flat_{i}"] = {
+                            "norm": float(torch.linalg.vector_norm(buf.float()).cpu()),
+                            "max_abs": float(torch.max(buf.abs()).cpu()),
+                        }
+                main_grad = getattr(opt, "main_grad", None)
+                if isinstance(main_grad, torch.Tensor):
+                    stats[f"{label}_main_grad"] = {
+                        "norm": float(torch.linalg.vector_norm(main_grad.float()).cpu()),
+                        "max_abs": float(torch.max(main_grad.abs()).cpu()),
+                    }
+            except Exception:
+                pass
+            return stats
+
+        def _clear_fp16_buckets(opt):
+            if opt is None:
+                return
+            try:
+                buckets = getattr(opt, "fp16_groups_flat", None)
+                if buckets:
+                    for buf in buckets:
+                        if buf is not None:
+                            buf.zero_()
+                main_grad = getattr(opt, "main_grad", None)
+                if isinstance(main_grad, torch.Tensor):
+                    main_grad.zero_()
+            except Exception:
+                pass
+        probe_pre = {}
+        probe_grad: Dict[str, torch.Tensor] = {}
+        probe_hooks: List = []
+        input_dump = {}
+        mini_debug_records: List[Dict] = []
+        probes = self._probe_params() if debug_enabled else {}
+        probe_subset_names = sorted(list(probes.keys()))[:3]
+        probe_subset = {n: probes[n] for n in probe_subset_names}
+        trace_steps = bool(int(os.getenv("PARITY_DS_TRACE_STEPS", "0")))
+
+        def _hash_stats(t: torch.Tensor) -> Dict[str, float]:
+            flat = t.detach().float().reshape(-1)[:4096]
+            if flat.numel() == 0:
+                return {"abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0}
+            flat64 = flat.to(torch.float64)
+            return {
+                "abs_sum": float(torch.sum(flat64.abs()).cpu()),
+                "sq_sum": float(torch.sum(flat64 * flat64).cpu()),
+                "max_abs": float(torch.max(flat64.abs()).cpu()),
+            }
+
+        def _grad_state(params: Dict[str, torch.nn.Parameter]) -> Dict[str, Dict[str, float | str]]:
+            state: Dict[str, Dict[str, float | str]] = {}
+            for name, p in params.items():
+                g = p.grad
+                if g is None:
+                    state[name] = {"state": "none"}
+                else:
+                    norm_val = float(torch.linalg.vector_norm(g.detach().float()).cpu())
+                    max_abs = float(torch.max(g.detach().abs()).cpu())
+                    state[name] = {"state": "zero" if norm_val == 0.0 else "nonzero", "norm": norm_val, "max_abs": max_abs}
+            return state
+
+
+
+        if debug_enabled:
+            for name, p in probes.items():
+                probe_pre[name] = _flatten_slice(p)
+            probe_hooks = self._attach_grad_hooks(probes, probe_grad)
+            _dump_debug(out_dir, impl, step_id, "pre_fwd", {"probe_pre": probe_pre})
+        meta = data.meta_info
+        impl = meta.get("impl", "deepspeed") if isinstance(meta, dict) else "deepspeed"
+        step_id = int(meta.get("step_id", 0)) if isinstance(meta, dict) else 0
+        out_dir = meta.get("parity_out_dir") if isinstance(meta, dict) else None
+        dump_this_step = _step_enabled(meta, step_id) if isinstance(meta, dict) else False
+        debug_env = bool(int(os.getenv("PARITY_DS_MINI_DEBUG", "0")))
+        force_zero_grad = bool(int(os.getenv("PARITY_DS_FORCE_ZERO_GRAD", "0")))
+        debug_enabled = dump_this_step or debug_env
+        trace_steps = bool(int(os.getenv("PARITY_DS_TRACE_STEPS", "0")))
+        fp16_bucket_debug = bool(int(os.getenv("PARITY_DS_FP16_BUCKET_DEBUG", "0")))
+        fp16_bucket_clear = bool(int(os.getenv("PARITY_DS_FP16_BUCKET_CLEAR", "0")))
+        probe_pre = {}
+        probe_grad: Dict[str, torch.Tensor] = {}
+        probe_hooks: List = []
+        input_dump = {}
+        mini_debug_records: List[Dict] = []
+        probes = self._probe_params() if debug_enabled else {}
+        probe_subset_names = sorted(list(probes.keys()))[:3]
+        probe_subset = {n: probes[n] for n in probe_subset_names}
+
+        def _hash_stats(t: torch.Tensor) -> Dict[str, float]:
+            flat = t.detach().float().reshape(-1)[:4096]
+            if flat.numel() == 0:
+                return {"abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0}
+            flat64 = flat.to(torch.float64)
+            return {
+                "abs_sum": float(torch.sum(flat64.abs()).cpu()),
+                "sq_sum": float(torch.sum(flat64 * flat64).cpu()),
+                "max_abs": float(torch.max(flat64.abs()).cpu()),
+            }
+
+        def _grad_state(params: Dict[str, torch.nn.Parameter]) -> Dict[str, Dict[str, float | str]]:
+            state: Dict[str, Dict[str, float | str]] = {}
+            for name, p in params.items():
+                g = p.grad
+                if g is None:
+                    state[name] = {"state": "none"}
+                else:
+                    norm_val = float(torch.linalg.vector_norm(g.detach().float()).cpu())
+                    max_abs = float(torch.max(g.detach().abs()).cpu())
+                    state[name] = {"state": "zero" if norm_val == 0.0 else "nonzero", "norm": norm_val, "max_abs": max_abs}
+            return state
+
+        if dump_this_step:
+            probes = self._probe_params()
+            for name, p in probes.items():
+                probe_pre[name] = _flatten_slice(p)
+            probe_hooks = self._attach_grad_hooks(probes, probe_grad)
+            _dump_debug(out_dir, impl, step_id, "pre_fwd", {"probe_pre": probe_pre})
+        meta = data.meta_info
+        impl = meta.get("impl", "deepspeed") if isinstance(meta, dict) else "deepspeed"
+        step_id = int(meta.get("step_id", 0)) if isinstance(meta, dict) else 0
+        out_dir = meta.get("parity_out_dir") if isinstance(meta, dict) else None
+        dump_this_step = _step_enabled(meta, step_id) if isinstance(meta, dict) else False
+        probe_pre = {}
+        probe_grad: Dict[str, torch.Tensor] = {}
+        probe_hooks: List = []
+        input_dump = {}
+        if dump_this_step:
+            probes = self._probe_params()
+            for name, p in probes.items():
+                probe_pre[name] = _flatten_slice(p)
+            probe_hooks = self._attach_grad_hooks(probes, probe_grad)
+            _dump_debug(out_dir, impl, step_id, "pre_fwd", {"probe_pre": probe_pre})
         for _ in range(self.config.ppo_epochs):
             for mini_batch in mini_batches:
-                grad_accum_steps = self._get_grad_accum_steps()
                 sp_factor = max(1, self.ulysses_sequence_parallel_size)
+                # enforce per-rank semantics: mini batch size should match config
+                any_tensor = next(iter(mini_batch.batch.values()))
+                actual_mini = any_tensor.shape[0]
+                expected_mini = self.config.ppo_mini_batch_size
+                if actual_mini != expected_mini:
+                    raise AssertionError(
+                        f"per-rank mini batch mismatch: actual {actual_mini} vs config {expected_mini} "
+                        "(config should already be per-rank, aligned with FSDP semantics)"
+                    )
+                assert (
+                    actual_mini % self.config.ppo_micro_batch_size_per_gpu == 0
+                ), f"mini {actual_mini} not divisible by micro {self.config.ppo_micro_batch_size_per_gpu}"
                 if torch.distributed.get_rank() == 0:
-                    dp_sz = torch.distributed.get_world_size() // sp_factor if torch.distributed.is_initialized() else 1
                     print(
-                        f"[ds-actor-scale] sp={sp_factor}, dp={dp_sz}, grad_accum={grad_accum_steps}, "
-                        f"sp_loss_divisor=1.0, use_sp_loss_scale=False"
+                        f"[ds-critic-batch] actual_mini={actual_mini}, config_mini={expected_mini}, "
+                        f"micro_bsz={self.config.ppo_micro_batch_size_per_gpu}, "
+                        f"use_dynamic_bsz={self.config.use_dynamic_bsz}, "
+                        f"micro_batches_expected={actual_mini // self.config.ppo_micro_batch_size_per_gpu}"
                     )
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    assert len(micro_batches) > 0, "micro_batches empty"
 
-                if self._use_manual_backward:
-                    self.actor_optimizer.zero_grad()
-                else:
-                    self.deepspeed_engine.zero_grad()
+                grad_accum_steps = len(micro_batches)
+                if torch.distributed.get_rank() == 0:
+                    world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+                    dp_sz = max(1, world // max(1, self.ulysses_sequence_parallel_size))
+                    print(
+                        f"[ds-critic-batch] mini={actual_mini}, config_mini={expected_mini}, "
+                        f"micro_bsz={self.config.ppo_micro_batch_size_per_gpu}, "
+                        f"micro_batches={len(micro_batches)}, grad_accum={grad_accum_steps}, dp={dp_sz}"
+                    )
+                if hasattr(self.deepspeed_engine, "set_gradient_accumulation_steps"):
+                    try:
+                        self.deepspeed_engine.set_gradient_accumulation_steps(grad_accum_steps)
+                    except Exception as exc:
+                        if torch.distributed.get_rank() == 0:
+                            print(f"[ds-actor-scale] set_gradient_accumulation_steps failed: {exc}")
+                if torch.distributed.get_rank() == 0:
+                    dp_sz = torch.distributed.get_world_size() // sp_factor if torch.distributed.is_initialized() else 1
+                    print(
+                        f"[ds-actor-scale] sp={sp_factor}, dp={dp_sz}, grad_accum={grad_accum_steps}"
+                    )
+
+                self.deepspeed_engine.zero_grad()
 
                 for idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
@@ -1331,17 +1558,19 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                     else:
                         micro_batch_metrics = {}
 
-                    # Let DeepSpeed handle loss scaling and gradient accumulation
+                    if self.config.use_dynamic_bsz:
+                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                    else:
+                        loss_scale_factor = 1.0 / grad_accum_steps
+
+                    # 使用 DeepSpeed 内部 GAS 缩放，避免外部二次缩放影响其他特性
                     is_last_micro = idx == len(micro_batches) - 1
                     self.deepspeed_engine.set_gradient_accumulation_boundary(is_last_micro)
-                    scaled_loss = policy_loss * sp_factor
-                    self.deepspeed_engine.backward(scaled_loss, scale_wrt_gas=True)
+                    loss = policy_loss
+                    self.deepspeed_engine.backward(loss, scale_wrt_gas=True)
 
-                    # Collect metrics (loss will be properly scaled for logging)
-                    if self.config.use_dynamic_bsz:
-                        metric_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
-                    else:
-                        metric_scale_factor = 1.0 / grad_accum_steps
+                    # Collect metrics (记录按外部缩放的数值，便于与 FSDP 对齐)
+                    metric_scale_factor = loss_scale_factor
 
                     micro_batch_metrics.update(
                         {
@@ -1351,19 +1580,16 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                             "actor/dp_size": float(dp_sz if 'dp_sz' in locals() else 1),
                             "actor/micro_batches_per_step": float(len(micro_batches)),
                             "actor/sp_loss_divisor": 1.0,
+                            "actor/loss_scale_factor": loss_scale_factor,
+                            "actor/token_sum_local": float(response_mask.sum().detach().cpu()),
                         }
                     )
                     micro_batch_metrics.update(pg_metrics)
                     append_to_dict(metrics, micro_batch_metrics)
 
-                # Prefer DeepSpeed global grad norm when ZeRO is active; otherwise fall back to local clip.
-                ds_zero = getattr(self.config, "zero_stage", 0)
-                if ds_zero and hasattr(self.deepspeed_engine, "get_global_grad_norm"):
-                    try:
-                        grad_norm_val = float(self.deepspeed_engine.get_global_grad_norm())
-                    except Exception:
-                        grad_norm_val = 0.0
-                else:
+                python_clip = bool(int(os.getenv("PARITY_DS_PYTHON_CLIP", "0")))
+                # Prefer python clip in parity mode or zero_stage=0 to mimic FSDP norm computation.
+                if python_clip or self.config.zero_stage == 0:
                     grad_norm_val = float(
                         torch.nn.utils.clip_grad_norm_(
                             self.actor_module.parameters(),
@@ -1371,29 +1597,58 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                             norm_type=2.0,
                         )
                     )
+                else:
+                    ds_zero = getattr(self.config, "zero_stage", 0)
+                    if ds_zero and hasattr(self.deepspeed_engine, "get_global_grad_norm"):
+                        try:
+                            grad_norm_val = float(self.deepspeed_engine.get_global_grad_norm())
+                        except Exception:
+                            grad_norm_val = 0.0
+                    else:
+                        grad_norm_val = float(
+                            torch.nn.utils.clip_grad_norm_(
+                                self.actor_module.parameters(),
+                                max_norm=self.config.grad_clip,
+                                norm_type=2.0,
+                            )
+                        )
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm_val})
 
                 # Step only once after all micro batches
                 self.deepspeed_engine.step()
 
-        if not self._use_manual_backward:
-            self.deepspeed_engine.zero_grad()
+        self.deepspeed_engine.zero_grad()
         return metrics
 
 
 class DeepSpeedPPOCritic(DataParallelPPOCritic):
     """PPO critic that delegates backward/step to a DeepSpeed engine."""
 
-    def __init__(self, config, critic_module, engine):
+    def __init__(self, config, critic_module, engine, ds_config: dict | None = None, force_torch_optimizer: bool = False):
         super().__init__(config=config, critic_module=critic_module, critic_optimizer=engine.optimizer)
         self.deepspeed_engine = engine
-        self._use_manual_backward = bool(int(os.getenv("DS_USE_MANUAL_BACKWARD", "0")))
+        self._ds_config_dict = ds_config or {}
+        # Always use DeepSpeed-managed backward/step; manual backward is disabled.
+        self._use_manual_backward = False
+        assert (
+            self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0
+        ), (
+            "ppo_mini_batch_size must be divisible by ppo_micro_batch_size_per_gpu "
+            "and should already be per-rank (same semantics as FSDP)."
+        )
         if torch.distributed.get_rank() == 0:
             base_opt = getattr(engine.optimizer, "optimizer", None)
             print(
                 f"[DEBUG][DS Critic] optimizer={type(engine.optimizer).__name__}, "
                 f"base_optimizer={type(base_opt).__name__ if base_opt else 'None'}, "
                 f"use_manual_backward={self._use_manual_backward}"
+            )
+            print(
+                f"[ds-critic-config] train_batch_size={self._ds_config_dict.get('train_batch_size')}, "
+                f"micro_bsz={self._ds_config_dict.get('train_micro_batch_size_per_gpu')}, "
+                f"grad_accum={self._ds_config_dict.get('gradient_accumulation_steps')}, "
+                f"dp_size={getattr(self, 'layout', None).dp_size if getattr(self, 'layout', None) else 'n/a'}, "
+                f"world_size={getattr(self, 'layout', None).world_size if getattr(self, 'layout', None) else 'n/a'}"
             )
 
     def _get_grad_accum_steps(self) -> int:
@@ -1415,6 +1670,93 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
                 torch.cuda.manual_seed_all(rng_seed)
 
         metrics = {}
+        meta = data.meta_info
+        impl = meta.get("impl", "deepspeed") if isinstance(meta, dict) else "deepspeed"
+        step_id = int(meta.get("step_id", 0)) if isinstance(meta, dict) else 0
+        out_dir = meta.get("parity_out_dir") if isinstance(meta, dict) else None
+        dump_this_step = _step_enabled(meta, step_id) if isinstance(meta, dict) else False
+        debug_env = bool(int(os.getenv("PARITY_DS_MINI_DEBUG", "0")))
+        force_zero_grad = bool(int(os.getenv("PARITY_DS_FORCE_ZERO_GRAD", "0")))
+        debug_enabled = dump_this_step or debug_env
+        trace_steps = bool(int(os.getenv("PARITY_DS_TRACE_STEPS", "0")))
+        fp16_bucket_debug = bool(int(os.getenv("PARITY_DS_FP16_BUCKET_DEBUG", "0")))
+        fp16_bucket_clear = bool(int(os.getenv("PARITY_DS_FP16_BUCKET_CLEAR", "0")))
+        probe_pre = {}
+        probe_grad: Dict[str, torch.Tensor] = {}
+        probe_hooks: List = []
+        input_dump = {}
+        mini_debug_records: List[Dict] = []
+        probes = self._probe_params() if debug_enabled else {}
+        probe_subset_names = sorted(list(probes.keys()))[:3]
+        probe_subset = {n: probes[n] for n in probe_subset_names}
+
+        def _collect_fp16_bucket_stats(opt, label: str) -> Dict[str, Dict[str, float]]:
+            stats: Dict[str, Dict[str, float]] = {}
+            if opt is None:
+                return stats
+            try:
+                buckets = getattr(opt, "fp16_groups_flat", None)
+                if buckets:
+                    for i, buf in enumerate(buckets[:3]):  # limit to first few to avoid heavy cost
+                        if buf is None:
+                            continue
+                        stats[f"{label}_fp16_flat_{i}"] = {
+                            "norm": float(torch.linalg.vector_norm(buf.float()).cpu()),
+                            "max_abs": float(torch.max(buf.abs()).cpu()),
+                        }
+                main_grad = getattr(opt, "main_grad", None)
+                if isinstance(main_grad, torch.Tensor):
+                    stats[f"{label}_main_grad"] = {
+                        "norm": float(torch.linalg.vector_norm(main_grad.float()).cpu()),
+                        "max_abs": float(torch.max(main_grad.abs()).cpu()),
+                    }
+            except Exception:
+                pass
+            return stats
+
+        def _clear_fp16_buckets(opt):
+            if opt is None:
+                return
+            try:
+                buckets = getattr(opt, "fp16_groups_flat", None)
+                if buckets:
+                    for buf in buckets:
+                        if buf is not None:
+                            buf.zero_()
+                main_grad = getattr(opt, "main_grad", None)
+                if isinstance(main_grad, torch.Tensor):
+                    main_grad.zero_()
+            except Exception:
+                pass
+
+        def _hash_stats(t: torch.Tensor) -> Dict[str, float]:
+            flat = t.detach().float().reshape(-1)[:4096]
+            if flat.numel() == 0:
+                return {"abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0}
+            flat64 = flat.to(torch.float64)
+            return {
+                "abs_sum": float(torch.sum(flat64.abs()).cpu()),
+                "sq_sum": float(torch.sum(flat64 * flat64).cpu()),
+                "max_abs": float(torch.max(flat64.abs()).cpu()),
+            }
+
+        def _grad_state(params: Dict[str, torch.nn.Parameter]) -> Dict[str, Dict[str, float | str]]:
+            state: Dict[str, Dict[str, float | str]] = {}
+            for name, p in params.items():
+                g = p.grad
+                if g is None:
+                    state[name] = {"state": "none"}
+                else:
+                    norm_val = float(torch.linalg.vector_norm(g.detach().float()).cpu())
+                    max_abs = float(torch.max(g.detach().abs()).cpu())
+                    state[name] = {"state": "zero" if norm_val == 0.0 else "nonzero", "norm": norm_val, "max_abs": max_abs}
+            return state
+
+        if debug_enabled:
+            for name, p in probes.items():
+                probe_pre[name] = _flatten_slice(p)
+            probe_hooks = self._attach_grad_hooks(probes, probe_grad)
+            _dump_debug(out_dir, impl, step_id, "pre_fwd", {"probe_pre": probe_pre})
 
         select_keys = [
             "input_ids",
@@ -1431,15 +1773,67 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
-        for _ in range(self.config.ppo_epochs):
-            for mini_batch in mini_batches:
-                grad_accum_steps = self._get_grad_accum_steps()
+        for epoch_idx in range(self.config.ppo_epochs):
+            for mini_idx, mini_batch in enumerate(mini_batches):
+                any_tensor = next(iter(mini_batch.batch.values()))
+                actual_mini = any_tensor.shape[0]
+                expected_mini = self.config.ppo_mini_batch_size
+                if actual_mini != expected_mini:
+                    raise AssertionError(
+                        f"per-rank mini batch mismatch: actual {actual_mini} vs config {expected_mini} "
+                        "(config should already be per-rank, aligned with FSDP semantics)"
+                    )
+                assert (
+                    actual_mini % self.config.ppo_micro_batch_size_per_gpu == 0
+                ), f"mini {actual_mini} not divisible by micro {self.config.ppo_micro_batch_size_per_gpu}"
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    assert len(micro_batches) > 0, "micro_batches empty"
+
+                grad_accum_steps = len(micro_batches)
+                if hasattr(self.deepspeed_engine, "set_gradient_accumulation_steps"):
+                    try:
+                        self.deepspeed_engine.set_gradient_accumulation_steps(grad_accum_steps)
+                    except Exception as exc:
+                        if torch.distributed.get_rank() == 0:
+                            print(f"[ds-critic-scale] set_gradient_accumulation_steps failed: {exc}")
                 sp_factor = max(1, self.ulysses_sequence_parallel_size)
+                debug_gas = bool(int(os.getenv("PARITY_DEBUG_GAS", "0")))
+                if debug_gas and torch.distributed.get_rank() == 0:
+                    ga_before = None
+                    try:
+                        ga_before = (
+                            self.deepspeed_engine.gradient_accumulation_steps()
+                            if callable(getattr(self.deepspeed_engine, "gradient_accumulation_steps", None))
+                            else getattr(self.deepspeed_engine, "gradient_accumulation_steps", None)
+                        )
+                    except Exception:
+                        pass
+                    print(
+                        f"[ds-critic-gas] grad_accum_expected={grad_accum_steps}, engine_before={ga_before}, "
+                        f"micro_batches={len(micro_batches)}, "
+                        f"cfg.grad_accum={self.config.deepspeed_config.get('gradient_accumulation_steps')}, "
+                        f"cfg.micro_bsz={self.config.ppo_micro_batch_size_per_gpu}, "
+                        f"cfg.train_batch_size={self.config.deepspeed_config.get('train_batch_size')}"
+                    )
+                # Re-read engine GAS after possible override
+                engine_ga = grad_accum_steps
+                try:
+                    engine_ga = (
+                        self.deepspeed_engine.gradient_accumulation_steps()
+                        if callable(getattr(self.deepspeed_engine, "gradient_accumulation_steps", None))
+                        else getattr(self.deepspeed_engine, "gradient_accumulation_steps", None)
+                    )
+                except Exception:
+                    pass
+                if engine_ga != grad_accum_steps:
+                    raise AssertionError(
+                        f"Engine gradient_accumulation_steps {engine_ga} != expected {grad_accum_steps}; "
+                        "check DeepSpeed config for overrides."
+                    )
                 if torch.distributed.get_rank() == 0:
                     world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
                     print(
@@ -1447,11 +1841,32 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
                         f"grad_accum={grad_accum_steps}, sp_loss_divisor=1.0, use_sp_loss_scale=False"
                     )
 
-                if self._use_manual_backward:
-                    self.critic_optimizer.zero_grad()
-                else:
-                    self.deepspeed_engine.zero_grad()
+                mini_debug: Dict[str, Any] = {"epoch": epoch_idx, "mini_idx": mini_idx}
+                if debug_enabled:
+                    mini_debug["pre_param_hash"] = {n: _hash_stats(p) for n, p in probe_subset.items()}
+                    mini_debug["pre_param_slice"] = {n: _flatten_slice(p) for n, p in probe_subset.items()}
+                    mini_debug["pre_grad_state"] = _grad_state(probe_subset)
+                    if trace_steps:
+                        mini_debug["ops"] = []
+                    leaks = {n: v for n, v in mini_debug["pre_grad_state"].items() if v.get("state") == "nonzero"}
+                    if leaks and torch.distributed.get_rank() == 0:
+                        print(f"[ds-critic-grad-leak] epoch={epoch_idx}, mini={mini_idx}, leaks={leaks}")
 
+                self.deepspeed_engine.zero_grad()
+
+                if force_zero_grad and debug_enabled:
+                    mini_debug["force_zero_grad"] = _grad_state(probe_subset)
+                if trace_steps and debug_enabled:
+                    mini_debug.setdefault("ops", []).append({"op": "zero_grad", "where": "pre_mini", "mini_idx": mini_idx})
+                if fp16_bucket_debug and debug_enabled:
+                    mini_debug["fp16_bucket_pre"] = _collect_fp16_bucket_stats(
+                        getattr(self.deepspeed_engine, "optimizer", None), "pre"
+                    )
+                if fp16_bucket_clear and debug_enabled:
+                    _clear_fp16_buckets(getattr(self.deepspeed_engine, "optimizer", None))
+                    mini_debug.setdefault("ops", []).append({"op": "clear_fp16_buckets", "mini_idx": mini_idx})
+
+                last_micro_inputs = None
                 for idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -1459,60 +1874,133 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
                     values = model_inputs["values"]
                     returns = model_inputs["returns"]
 
+                    if dump_this_step and not input_dump:
+                        input_dump = {
+                            "input_ids": model_inputs["input_ids"][:2, :16].detach().cpu(),
+                            "responses": model_inputs["responses"][:2, :16].detach().cpu(),
+                            "attention_mask": model_inputs["attention_mask"][:2, :16].detach().cpu(),
+                            "position_ids": model_inputs["position_ids"][:2, :16].detach().cpu(),
+                            "values": values[:2, :16].detach().cpu(),
+                            "returns": returns[:2, :16].detach().cpu(),
+                            "response_mask": response_mask[:2, :16].detach().cpu(),
+                            "hash_input_ids": _hash_tensor(model_inputs["input_ids"]),
+                        }
+                        # extra debug for broadcast consistency
+                        input_dump["hash_attention_mask"] = _hash_tensor(model_inputs["attention_mask"])
+                        input_dump["hash_position_ids"] = _hash_tensor(model_inputs["position_ids"])
+
                     vpreds = self._forward_micro_batch(model_inputs)
-
-                    # ----- SP-aware loss aggregation -----
-                    vpredclipped = verl_F.clip_by_value(
-                        vpreds, values - self.config.cliprange_value, values + self.config.cliprange_value
+                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
+                        vpreds=vpreds,
+                        values=values,
+                        returns=returns,
+                        response_mask=response_mask,
+                        cliprange_value=self.config.cliprange_value,
+                        loss_agg_mode=self.config.loss_agg_mode,
                     )
-                    vf_losses1 = (vpreds - returns) ** 2
-                    vf_losses2 = (vpredclipped - returns) ** 2
-                    clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
+                    if self.config.use_dynamic_bsz:
+                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                    else:
+                        loss_scale_factor = 1.0 / grad_accum_steps
+                    if torch.distributed.get_rank() == 0:
+                        try:
+                            eng_ga = (
+                                self.deepspeed_engine.gradient_accumulation_steps()
+                                if callable(getattr(self.deepspeed_engine, "gradient_accumulation_steps", None))
+                                else getattr(self.deepspeed_engine, "gradient_accumulation_steps", None)
+                            )
+                        except Exception:
+                            eng_ga = None
+                        dp_sz_eff = max(
+                            1,
+                            (torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1)
+                            // sp_factor,
+                        )
+                        print(
+                            f"[ds-critic-loss-debug] micro_idx={idx}, grad_accum={grad_accum_steps}, "
+                            f"eng_grad_accum={eng_ga}, dp_size={dp_sz_eff}, "
+                            f"token_sum={float(response_mask.sum().detach().cpu())}, "
+                            f"vf_loss={float(vf_loss.detach().cpu())}, "
+                            f"loss_scale_factor={loss_scale_factor}"
+                        )
 
-                    token_sum = torch.nan_to_num(response_mask.sum(), nan=0.0)
-                    loss_sum = torch.nan_to_num((clipped_vf_losses * response_mask).sum(), nan=0.0)
-                    clip_used = torch.gt(vf_losses2, vf_losses1).float()
-                    clip_used_sum = torch.nan_to_num((clip_used * response_mask).sum(), nan=0.0)
-                    vpred_sum = torch.nan_to_num((vpreds * response_mask).sum(), nan=0.0)
-
-                    sp_group = get_ulysses_sequence_parallel_group()
-                    if sp_group is not None and sp_factor > 1:
-                        for t in (token_sum, loss_sum, clip_used_sum, vpred_sum):
-                            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM, group=sp_group)
-
-                    global_token_sum = token_sum.clamp_min(1.0)
-                    dp_size = max(
-                        1,
-                        (torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1) // sp_factor,
-                    )
-                    vf_loss = 0.5 * (loss_sum / global_token_sum) * dp_size
-                    vf_clipfrac = (clip_used_sum / global_token_sum)
-                    vpred_mean_global = (vpred_sum / global_token_sum).detach().item()
-                    vpred_std = torch.nan_to_num(vpreds.float().std(), nan=0.0).item()
-                    returns_std = torch.nan_to_num(returns.float().std(), nan=0.0).item()
-                    per_token_mse = loss_sum / global_token_sum
-                    per_token_rmse = torch.sqrt(torch.nan_to_num(per_token_mse, nan=0.0)).item()
-
-                    # Let DeepSpeed handle loss scaling and gradient accumulation
+                    # 使用 DS 内部 GAS 缩放（scale_wrt_gas=True），与早期实现保持一致
+                    loss = vf_loss
                     is_last_micro = idx == len(micro_batches) - 1
                     self.deepspeed_engine.set_gradient_accumulation_boundary(is_last_micro)
-                    self.deepspeed_engine.backward(vf_loss, scale_wrt_gas=True)
+                    self.deepspeed_engine.backward(loss, scale_wrt_gas=True)
 
-                    # Collect metrics (loss will be properly scaled for logging)
-                    if self.config.use_dynamic_bsz:
-                        metric_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
-                    else:
-                        metric_scale_factor = 1.0 / grad_accum_steps
+                    if debug_enabled and is_last_micro:
+                        if trace_steps:
+                            mini_debug.setdefault("ops", []).append(
+                                {"op": "backward", "where": "last_micro", "mini_idx": mini_idx, "micro_idx": idx}
+                            )
+                        grad_snapshot = {}
+                        for name, p in probe_subset.items():
+                            g = p.grad
+                            if g is None:
+                                continue
+                            grad_snapshot[name] = {
+                                "norm": float(torch.linalg.vector_norm(g.detach().float()).cpu()),
+                                "max_abs": float(torch.max(g.detach().abs()).cpu()),
+                                "slice": _flatten_slice(g, limit=256),
+                            }
+                        try:
+                            boundary_flag = bool(self.deepspeed_engine.is_gradient_accumulation_boundary())
+                        except Exception:
+                            boundary_flag = "NA"
+                        try:
+                            engine_ga_now = (
+                                self.deepspeed_engine.gradient_accumulation_steps()
+                                if callable(getattr(self.deepspeed_engine, "gradient_accumulation_steps", None))
+                                else getattr(self.deepspeed_engine, "gradient_accumulation_steps", None)
+                            )
+                        except Exception:
+                            engine_ga_now = "NA"
+                        mini_debug["post_backward"] = {
+                            "micro_idx": idx,
+                            "grad": grad_snapshot,
+                            "boundary": boundary_flag,
+                            "engine_ga": engine_ga_now,
+                        }
+                        # Extra verification: compare recorded loss/grad norm with actual tensors
+                        verify = bool(int(os.getenv("PARITY_DS_VERIFY_METRICS", "0")))
+                        if verify:
+                            try:
+                                torch_grad_norm = float(
+                                    torch.nn.utils.clip_grad_norm_(
+                                        self.critic_module.parameters(),
+                                        max_norm=float("inf"),
+                                        norm_type=2.0,
+                                    )
+                                )
+                            except Exception:
+                                torch_grad_norm = None
+                            mini_debug["verify"] = {
+                                "loss_item": float(loss.detach().cpu()),
+                                "torch_grad_norm_infclip": torch_grad_norm,
+                            }
+                        if fp16_bucket_debug and debug_enabled:
+                            mini_debug["fp16_bucket_post_backward"] = _collect_fp16_bucket_stats(
+                                getattr(self.deepspeed_engine, "optimizer", None), "post_bwd"
+                            )
+                        last_micro_inputs = model_inputs
 
                     micro_batch_metrics = {
-                        "critic/vf_loss": vf_loss.detach().item() * metric_scale_factor,
+                        "critic/vf_loss": vf_loss.detach().item() * loss_scale_factor,
                         "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-                        "critic/vpred_mean": vpred_mean_global,
-                        "critic/vpred_std": vpred_std,
-                        "critic/returns_std": returns_std,
-                        "critic/num_tokens": global_token_sum.detach().item(),
-                        "critic/rmse_per_token": per_token_rmse,
+                        "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
                         "critic/grad_accum_steps": grad_accum_steps,
+                        "critic/token_sum_local": float(response_mask.sum().detach().cpu()),
+                        "critic/per_token_mse_raw": float(
+                            torch.nan_to_num(((vpreds - returns) ** 2 * response_mask).sum(), nan=0.0)
+                            / max(1.0, float(response_mask.sum().detach().cpu()))
+                        ),
+                        "critic/loss_scale_factor": loss_scale_factor,
+                        "critic/loss_unscaled": float(vf_loss.detach().cpu()),
+                        "critic/loss_for_backward": float(loss.detach().cpu()),
+                        "critic/vpreds_slice": vpreds[:2, :16].detach().cpu(),
+                        "critic/returns_slice": returns[:2, :16].detach().cpu(),
                         "critic/sp_size": sp_factor,
                         "critic/dp_size": max(
                             1,
@@ -1524,14 +2012,20 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
                     }
                     append_to_dict(metrics, micro_batch_metrics)
 
-                # Prefer DeepSpeed global grad norm when ZeRO is active; otherwise fall back to local clip.
-                ds_zero = getattr(self.config, "zero_stage", 0)
-                if ds_zero and hasattr(self.deepspeed_engine, "get_global_grad_norm"):
-                    try:
-                        grad_norm_val = float(self.deepspeed_engine.get_global_grad_norm())
-                    except Exception:
-                        grad_norm_val = 0.0
-                else:
+                    if dump_this_step:
+                        post_fwd_payload = {
+                            "vpreds": vpreds[:2, :16].detach().cpu(),
+                        "vf_loss": vf_loss.detach().cpu(),
+                        "loss_for_log": (vf_loss * loss_scale_factor).detach().cpu(),
+                        "loss_scale_factor": loss_scale_factor,
+                        }
+                        if input_dump:
+                            post_fwd_payload["inputs"] = input_dump
+                        _dump_debug(out_dir, impl, step_id, "post_fwd_pre_bwd", post_fwd_payload)
+
+                python_clip = bool(int(os.getenv("PARITY_DS_PYTHON_CLIP", "0")))
+                # Prefer python clip in parity mode or zero_stage=0 to mimic FSDP norm computation.
+                if python_clip or self.config.zero_stage == 0:
                     grad_norm_val = float(
                         torch.nn.utils.clip_grad_norm_(
                             self.critic_module.parameters(),
@@ -1539,13 +2033,96 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
                             norm_type=2.0,
                         )
                     )
+                else:
+                    ds_zero = getattr(self.config, "zero_stage", 0)
+                    if ds_zero and hasattr(self.deepspeed_engine, "get_global_grad_norm"):
+                        try:
+                            grad_norm_val = float(self.deepspeed_engine.get_global_grad_norm())
+                        except Exception:
+                            grad_norm_val = 0.0
+                    else:
+                        grad_norm_val = float(
+                            torch.nn.utils.clip_grad_norm_(
+                                self.critic_module.parameters(),
+                                max_norm=self.config.grad_clip,
+                                norm_type=2.0,
+                            )
+                    )
                 append_to_dict(metrics, {"critic/grad_norm": grad_norm_val})
+                if dump_this_step:
+                    post_bwd = {
+                        "grad_norm": float(grad_norm_val),
+                        "grad_store": probe_grad,
+                    }
+                    _dump_debug(out_dir, impl, step_id, "post_bwd_pre_step", post_bwd)
+                if debug_enabled:
+                    mini_debug["post_clip_grad_norm"] = float(grad_norm_val)
+                    opt = getattr(self.deepspeed_engine, "optimizer", None)
+                  
 
                 # Step only once after all micro batches
                 self.deepspeed_engine.step()
+                if trace_steps and debug_enabled:
+                    mini_debug.setdefault("ops", []).append({"op": "step", "mini_idx": mini_idx})
 
-        if not self._use_manual_backward:
-            self.deepspeed_engine.zero_grad()
+                if debug_enabled:
+                    post_hash = {n: _hash_stats(p) for n, p in probe_subset.items()}
+                    post_slice = {n: _flatten_slice(p) for n, p in probe_subset.items()}
+                    delta = {}
+                    for name, post in post_slice.items():
+                        pre_slice = mini_debug.get("pre_param_slice", {}).get(name)
+                        if pre_slice is not None and pre_slice.numel() == post.numel():
+                            delta[name] = float(torch.max((post - pre_slice).abs()).cpu())
+                    mini_debug["post_step_param_hash"] = post_hash
+                    mini_debug["post_step_param_delta_max_abs"] = delta
+                    fwd_probe = None
+                    if last_micro_inputs is not None:
+                        try:
+                            with torch.no_grad():
+                                fwd_out = self._forward_micro_batch(last_micro_inputs)
+                            fwd_probe = float(torch.max(fwd_out.detach().abs()).cpu())
+                        except Exception as exc:
+                            fwd_probe = f"error:{exc}"
+                    mini_debug["post_step_forward_max_abs"] = fwd_probe
+                    # Capture optimizer state just before/after step for offline replay.
+                    opt = getattr(self.deepspeed_engine, "optimizer", None)
+                
+                    if fp16_bucket_debug:
+                        mini_debug["fp16_bucket_post_step"] = _collect_fp16_bucket_stats(
+                            getattr(self.deepspeed_engine, "optimizer", None), "post_step"
+                        )
+                    mini_debug_records.append(mini_debug)
+
+               
+                self.deepspeed_engine.zero_grad()
+                if trace_steps and debug_enabled:
+                    mini_debug.setdefault("ops", []).append({"op": "zero_grad", "where": "post_step", "mini_idx": mini_idx})
+
+        self.deepspeed_engine.zero_grad()
+        if trace_steps and debug_enabled and mini_debug_records:
+            # Append a final marker to the last mini for clarity
+            mini_debug_records[-1].setdefault("ops", []).append({"op": "zero_grad", "where": "final_reset"})
+        if dump_this_step:
+            post_step = {}
+            probes = self._probe_params()
+            for name, p in probes.items():
+                slice_now = _flatten_slice(p)
+                prev = probe_pre.get(name)
+                delta = slice_now - prev if prev is not None else slice_now
+                post_step[name] = {"param": slice_now, "delta": delta}
+            payload = {
+                "inputs": input_dump,
+                "probe_pre": probe_pre,
+                "probe_grad": probe_grad,
+                "post_step": post_step,
+                "mini_debug": mini_debug_records,
+                "step_id": step_id,
+                "impl": impl,
+            }
+            _dump_debug(out_dir, impl, step_id, "post_step", payload)
+        if probe_hooks:
+            for h in probe_hooks:
+                h.remove()
         return metrics
 
 
@@ -1595,6 +2172,8 @@ class CriticWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         """Initialize critic model with native DeepSpeed."""
+
+        import torch  # local binding to avoid scope issues when checking distributed state
 
         import_external_libs(self.config.model.get("external_lib", None))
 
@@ -1721,11 +2300,15 @@ class CriticWorker(Worker, DistProfilerExtension):
             torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         )
         sp_size = self.layout.sp_size if self.layout is not None else 1
+        if world_size != max(1, dp_size) * max(1, sp_size):
+            raise AssertionError(f"world_size({world_size}) must equal dp_size({dp_size}) * sp_size({sp_size})")
         per_rank_mini = self.config.ppo_mini_batch_size
         micro_bsz = self.config.get("ppo_micro_batch_size_per_gpu", 1) or 1
-        # micro_bsz 已按 sp_size 归一，这里不再除 sp，保持 GAS 与 micro batch 数一致
-        ds_grad_accum = max(1, per_rank_mini // micro_bsz)
-        ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * world_size)
+        ds_grad_accum, ds_train_batch_size = _derive_ds_batch_params(per_rank_mini, micro_bsz, dp_size)
+        # Cache computed sizes explicitly to avoid stale/frozen config copies.
+        setattr(self.config.deepspeed_config, "ds_train_batch_size", ds_train_batch_size)
+        setattr(self.config.deepspeed_config, "ds_grad_accum", ds_grad_accum)
+        setattr(self.config.deepspeed_config, "ds_micro_batch_size_per_gpu", micro_bsz)
 
         if self.rank == 0:
             print(
@@ -1733,7 +2316,13 @@ class CriticWorker(Worker, DistProfilerExtension):
                 f"per_rank_mini={per_rank_mini}, micro_bsz={micro_bsz}, grad_accum={ds_grad_accum}, "
                 f"train_batch_size={ds_train_batch_size}"
             )
+            print(
+                f"[ds-critic-config-detail] ds_cfg.train_batch_size={ds_train_batch_size}, "
+                f"ds_cfg.grad_accum={ds_grad_accum}, "
+                f"ppo_micro_batch_size_per_gpu={self.config.ppo_micro_batch_size_per_gpu}"
+            )
 
+        python_clip = bool(int(os.getenv("PARITY_DS_PYTHON_CLIP", "0")))
         ds_config = get_deepspeed_config(
             optimizer_type=self.config.optim.get("optimizer", "AdamW"),
             train_batch_size=ds_train_batch_size,
@@ -1747,13 +2336,53 @@ class CriticWorker(Worker, DistProfilerExtension):
             bf16_enabled=bf16_enabled,
             cpu_offload=self.config.deepspeed_config.get("param_offload", False),
             offload_optimizer=self.config.deepspeed_config.get("optimizer_offload", False),
-            gradient_clipping=self.config.get("grad_clip", None),
+            gradient_clipping=0.0 if python_clip else self.config.get("grad_clip", None),
         )
+        # Force pure torch AdamW to bypass fused/FusedAdam path.
+        ds_config["optimizer"]["params"]["torch_adam"] = True
+        ds_config["optimizer"]["params"]["fused"] = False
+        import torch.optim
+        torch_optimizer = torch.optim.AdamW(
+            critic_module.parameters(),
+            lr=self.config.optim.lr,
+            betas=self.config.optim.get("betas", [0.9, 0.999]),
+            weight_decay=self.config.optim.get("weight_decay", 0.01),
+        )
+
+        # Static sanity checks before touching DeepSpeed to ensure we pass the intended dict.
+        expected_train_batch = micro_bsz * ds_grad_accum * dp_size
+        if ds_config.get("gradient_accumulation_steps") != ds_grad_accum:
+            raise AssertionError(
+                f"ds_config.gradient_accumulation_steps={ds_config.get('gradient_accumulation_steps')} "
+                f"!= expected {ds_grad_accum}"
+            )
+        if ds_config.get("train_micro_batch_size_per_gpu") != micro_bsz:
+            raise AssertionError(
+                f"ds_config.train_micro_batch_size_per_gpu={ds_config.get('train_micro_batch_size_per_gpu')} "
+                f"!= expected {micro_bsz}"
+            )
+        if ds_config.get("train_batch_size") != expected_train_batch:
+            raise AssertionError(
+                f"ds_config.train_batch_size={ds_config.get('train_batch_size')} "
+                f"!= micro_bsz({micro_bsz}) * grad_accum({ds_grad_accum}) * dp_size({dp_size})"
+            )
+        if self.rank == 0:
+            print(f"[ds-critic-config-final] {convert_to_regular_types(ds_config)}")
+
+        # DeepSpeed 默认按 world_size 校验 train_batch_size；为保持与 FSDP 同步的 DP 语义（micro * GAS * dp_size），禁用该断言。
+        try:
+            import deepspeed.runtime.config as ds_cfg_mod
+
+            if hasattr(ds_cfg_mod.DeepSpeedConfig, "_batch_assertion"):
+                ds_cfg_mod.DeepSpeedConfig._batch_assertion = lambda self: None
+        except Exception:
+            pass
 
         self.critic_engine, optimizer, _, lr_scheduler = initialize_deepspeed_engine(
             model=critic_module,
             config=ds_config,
             model_parameters=critic_module.parameters(),
+            optimizer=torch_optimizer,
         )
 
         self.critic_module = self.critic_engine.module
@@ -1761,8 +2390,30 @@ class CriticWorker(Worker, DistProfilerExtension):
         self.critic_lr_scheduler = lr_scheduler
 
         self.critic = DeepSpeedPPOCritic(
-            config=self.config, critic_module=self.critic_module, engine=self.critic_engine
+            config=self.config,
+            critic_module=self.critic_module,
+            engine=self.critic_engine,
+            ds_config=ds_config,
         )
+
+        if self.rank == 0:
+            opt = self.critic_engine.optimizer
+            base_opt = getattr(opt, "optimizer", None)
+            fused_flag = getattr(getattr(opt, "defaults", None), "get", lambda k, d=None: d)("fused", None)
+            has_master = hasattr(opt, "fp32_param_groups")
+            try:
+                eng_ga = (
+                    self.critic_engine.gradient_accumulation_steps()
+                    if callable(getattr(self.critic_engine, "gradient_accumulation_steps", None))
+                    else getattr(self.critic_engine, "gradient_accumulation_steps", None)
+                )
+            except Exception:
+                eng_ga = "NA"
+            print(
+                f"[ds-critic-optimizer] class={type(opt).__name__}, "
+                f"base_class={type(base_opt).__name__ if base_opt else 'None'}, "
+                f"fused_flag={fused_flag}, has_fp32_master={has_master}, engine_grad_accum={eng_ga}"
+            )
 
         # Setup checkpoint manager for critic (mirror actor behavior)
         # Expose engine handle for DeepSpeedCheckpointManager via self.engine
