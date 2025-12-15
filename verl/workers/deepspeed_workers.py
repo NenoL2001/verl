@@ -448,11 +448,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
             )
             sp_size = layout.sp_size if layout is not None else 1
-            per_rank_mini = max(1, self.config.actor.ppo_mini_batch_size // max(1, dp_size))
+            # per-rank mini_batch is global mini divided by dp*sp; micro_bsz 已按 sp 归一
+            per_rank_mini = max(1, self.config.actor.ppo_mini_batch_size // max(1, dp_size * sp_size))
             micro_bsz = self.config.actor.get("ppo_micro_batch_size_per_gpu", 1) or 1
             # micro_bsz 已在归一化时按 sp_size 缩过，这里不再除 sp，保证 GAS 与 micro_batches 数一致
             ds_grad_accum = max(1, per_rank_mini // micro_bsz)
-            ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size)
+            # DS 断言使用 world_size=dp*sp，这里配平以保持 train_batch_size == global mini
+            ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size * sp_size)
 
             ds_config = get_deepspeed_config(
                 optimizer_type=optim_config.get("optimizer", "AdamW"),
@@ -1713,12 +1715,13 @@ class CriticWorker(Worker, DistProfilerExtension):
             torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         )
         sp_size = self.layout.sp_size if self.layout is not None else 1
-        per_rank_mini = max(1, self.config.ppo_mini_batch_size // max(1, dp_size))
+        # per-rank mini_batch is global mini divided by dp*sp; micro_bsz 已按 sp 归一
+        per_rank_mini = max(1, self.config.ppo_mini_batch_size // max(1, dp_size * sp_size))
         micro_bsz = self.config.get("ppo_micro_batch_size_per_gpu", 1) or 1
         # micro_bsz 已按 sp_size 归一，这里不再除 sp，保持 GAS 与 micro batch 数一致
         ds_grad_accum = max(1, per_rank_mini // micro_bsz)
         # DeepSpeed asserts train_batch_size against global world_size (dp * sp); scale by sp_size to satisfy it
-        ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size)
+        ds_train_batch_size = max(1, micro_bsz * ds_grad_accum * dp_size * sp_size)
 
         ds_config = get_deepspeed_config(
             optimizer_type=self.config.optim.get("optimizer", "AdamW"),
