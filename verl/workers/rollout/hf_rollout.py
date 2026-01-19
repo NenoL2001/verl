@@ -80,6 +80,16 @@ class HFRollout(BaseRollout):
             trust_remote_code=self.model_config.trust_remote_code,
         ).to(get_device_name())
 
+    # HF 单机推理无需权重热更新/释放，这里提供空实现满足抽象接口
+    def release(self):
+        return None
+
+    def resume(self):
+        return None
+
+    def update_weights(self, *args, **kwargs):
+        return None
+
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
         num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)

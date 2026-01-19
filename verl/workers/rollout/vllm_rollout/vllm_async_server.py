@@ -25,7 +25,6 @@ from uuid import uuid4
 import cloudpickle as pickle
 import numpy as np
 import ray
-import vllm.entrypoints.cli.serve
 import zmq
 from packaging import version
 from ray.actor import ActorHandle
@@ -320,7 +319,7 @@ class vLLMHttpServer:
             "disable_log_stats": self.config.disable_log_stats,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
             "seed": self.config.get("seed", 0),
-            "override_generation_config": json.dumps(override_generation_config),
+            "override_generation_config": override_generation_config,
             "quantization": quantization,
             "hf_overrides": hf_overrides,
             "scheduling_policy": self.config.scheduling_policy,
@@ -370,24 +369,11 @@ class vLLMHttpServer:
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
 
-        server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
+        args["model"] = self.model_config.local_path
 
-        if self.replica_rank == 0:
-            pprint(server_args)
-
-        CMD_MODULES = [vllm.entrypoints.cli.serve]
-        parser = FlexibleArgumentParser(description="vLLM CLI")
-        subparsers = parser.add_subparsers(required=False, dest="subparser")
-        cmds = {}
-        for cmd_module in CMD_MODULES:
-            new_cmds = cmd_module.cmd_init()
-            for cmd in new_cmds:
-                cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
-                cmds[cmd.name] = cmd
-        server_args = parser.parse_args(args=server_args)
-        server_args.model = server_args.model_tag
-        if server_args.subparser in cmds:
-            cmds[server_args.subparser].validate(server_args)
+        allowed = set(inspect.signature(AsyncEngineArgs).parameters.keys())
+        filtered_args = {k: v for k, v in args.items() if k in allowed}
+        server_args = AsyncEngineArgs(**filtered_args)
 
         # 2. setup distributed executor backend
         distributed_executor_backend = ExternalZeroMQDistributedExecutor if len(self.workers) > 0 else None
@@ -406,8 +392,8 @@ class vLLMHttpServer:
         else:
             await self.run_headless(server_args)
 
-    async def run_server(self, args: argparse.Namespace):
-        engine_args = AsyncEngineArgs.from_cli_args(args)
+    async def run_server(self, args: argparse.Namespace | AsyncEngineArgs):
+        engine_args = args if isinstance(args, AsyncEngineArgs) else AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
@@ -435,9 +421,8 @@ class vLLMHttpServer:
         self.engine = engine_client
         self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
 
-    async def run_headless(self, args: argparse.Namespace):
-        # Create the EngineConfig.
-        engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+    async def run_headless(self, args: argparse.Namespace | AsyncEngineArgs):
+        engine_args = args if isinstance(args, AsyncEngineArgs) else vllm.AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context, headless=True)
 

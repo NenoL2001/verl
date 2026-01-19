@@ -36,6 +36,7 @@ from tensordict import TensorDict
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForVision2Seq
+from peft import LoraConfig, TaskType, get_peft_model
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -64,6 +65,7 @@ from verl.utils.device import (
     get_torch_device,
     set_expandable_segments,
 )
+from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
@@ -240,13 +242,20 @@ class ActorRolloutRefWorker(Worker):
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
+            device_id = None
+            if torch.cuda.is_available():
+                try:
+                    dev_idx = get_device_id()
+                    device_id = torch.device(f"cuda:{dev_idx}")
+                except Exception:
+                    device_id = None
             torch.distributed.init_process_group(
                 backend=get_nccl_backend(),
                 rank=rank,
                 world_size=world_size,
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
-                device_id=get_device_id() if torch.cuda.is_available() else None,
+                device_id=device_id,
             )
 
         # Parse role
@@ -297,9 +306,9 @@ class ActorRolloutRefWorker(Worker):
         else:
             self.ref_layout = None
 
-        lora_rank = self.config.model.get("lora_rank", 0)
-        if lora_rank and lora_rank > 0:
-            raise ValueError("DeepSpeed strategy does not support LoRA in the minimal integration.")
+        self.lora_rank = getattr(self.config.model, "lora_rank", 0)
+        self.lora_alpha = getattr(self.config.model, "lora_alpha", 16)
+        self.lora_target_modules = convert_to_regular_types(getattr(self.config.model, "target_modules", None))
 
     def _build_model_optimizer(
         self,
@@ -388,6 +397,22 @@ class ActorRolloutRefWorker(Worker):
                 trust_remote_code=trust_remote_code,
             )
         _debug_print(f"{role}::_build_model_optimizer: from_pretrained done")
+
+        # Optional LoRA injection
+        if self.lora_rank and self.lora_rank > 0:
+            lora_cfg = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=self.lora_rank,
+                lora_alpha=self.lora_alpha,
+                target_modules=self.lora_target_modules or "all-linear",
+                bias="none",
+            )
+            actor_module = get_peft_model(actor_module, lora_cfg)
+            try:
+                if torch.distributed.get_rank() == 0:
+                    actor_module.print_trainable_parameters()
+            except Exception:
+                pass
 
         # Apply Liger kernel
         if use_liger:
@@ -1160,7 +1185,9 @@ class ActorRolloutRefWorker(Worker):
             data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
             data.meta_info["temperature"] = self.config.rollout.temperature
 
-            log_probs, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            log_prob_outputs = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            log_probs = log_prob_outputs["log_probs"]
+            entropys = log_prob_outputs["entropys"]
 
             output = DataProto.from_dict(
                 tensors={"old_log_probs": log_probs, "entropys": entropys},
@@ -1188,7 +1215,13 @@ class ActorRolloutRefWorker(Worker):
         ctx = manager if manager is not None else nullcontext()
         with ctx:
             data = data.to("cpu")
-            log_prob, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            log_prob_out = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            if isinstance(log_prob_out, dict):
+                log_prob = log_prob_out.get("log_probs", log_prob_out.get("log_prob", log_prob_out.get("logprobs")))
+            elif isinstance(log_prob_out, (tuple, list)):
+                log_prob = log_prob_out[0]
+            else:
+                log_prob = log_prob_out
             output = DataProto.from_dict(tensors={"ref_log_prob": log_prob})
 
         return output.to("cpu")
@@ -1269,8 +1302,8 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
             for mini_batch in mini_batches:
                 grad_accum_steps = self._get_grad_accum_steps()
                 sp_factor = max(1, self.ulysses_sequence_parallel_size)
+                dp_sz = torch.distributed.get_world_size() // sp_factor if torch.distributed.is_initialized() else 1
                 if torch.distributed.get_rank() == 0:
-                    dp_sz = torch.distributed.get_world_size() // sp_factor if torch.distributed.is_initialized() else 1
                     print(
                         f"[ds-actor-scale] sp={sp_factor}, dp={dp_sz}, grad_accum={grad_accum_steps}, "
                         f"sp_loss_divisor=1.0, use_sp_loss_scale=False"
@@ -1297,9 +1330,11 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     calculate_entropy = entropy_coeff != 0
-                    entropy, log_prob = self._forward_micro_batch(
+                    forward_out = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+                    log_prob = forward_out["log_probs"]
+                    entropy = forward_out.get("entropys")
 
                     old_log_prob = log_prob.detach() if on_policy else model_inputs["old_log_probs"]
 
@@ -1357,12 +1392,12 @@ class DeepSpeedPPOActor(DataParallelPPOActor):
                             "old_log_prob": _stat(old_log_prob),
                             "advantages": _stat(advantages),
                             "pg_loss": _stat(pg_loss),
-                            "entropy": _stat(entropy),
+                            "entropy": _stat(entropy) if entropy is not None else _stat(None),
                         }
                         if not torch.isfinite(pg_loss).all() or not torch.isfinite(log_prob).all():
                             print(f"[ds-actor-nan] micro_idx={idx}, stats={log_info}")
 
-                    if entropy_coeff != 0:
+                    if entropy_coeff != 0 and entropy is not None:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
@@ -1613,11 +1648,18 @@ class CriticWorker(Worker):
         self.layout: ParallelLayout | None = None
 
         if not torch.distributed.is_initialized():
+            device_id = None
+            if torch.cuda.is_available():
+                try:
+                    dev_idx = get_device_id()
+                    device_id = torch.device(f"cuda:{dev_idx}")
+                except Exception:
+                    device_id = None
             torch.distributed.init_process_group(
                 backend=get_nccl_backend(),
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
-                device_id=get_device_id() if torch.cuda.is_available() else None,
+                device_id=device_id,
             )
 
         # Build layout & register dispatch on DP dimension
@@ -1951,11 +1993,18 @@ class RewardModelWorker(Worker):
         self.layout: ParallelLayout | None = None
         self.reward_sharding_manager = None
         if not torch.distributed.is_initialized():
+            device_id = None
+            if torch.cuda.is_available():
+                try:
+                    dev_idx = get_device_id()
+                    device_id = torch.device(f"cuda:{dev_idx}")
+                except Exception:
+                    device_id = None
             torch.distributed.init_process_group(
                 backend=get_nccl_backend(),
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
-                device_id=get_device_id() if torch.cuda.is_available() else None,
+                device_id=device_id,
             )
 
         # Build layout (DP only)

@@ -194,6 +194,9 @@ class FSDPEngineConfig(EngineConfig):
 class DeepSpeedEngineConfig(EngineConfig):
     """Configuration for DeepSpeed engine (minimal subset)."""
 
+    # Allow runtime syncs (e.g., actor zero_stage propagation) without hitting BaseConfig freeze.
+    _mutable_fields = EngineConfig._mutable_fields | {"zero_stage"}
+
     # dtype / precision controls
     model_dtype: str = "fp32"  # initial parameter dtype
     mixed_precision: Optional[dict[str, Any] | str] = None  # e.g. {"param_dtype": "bf16"} or "bf16"/"fp16"

@@ -20,7 +20,10 @@ from typing import Any, Callable, Sequence
 import torch
 import torch.distributed as dist
 from tensordict import TensorDict
-from torch.distributed.tensor import DTensor
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
 from veomni.distributed import parallel_state
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.torch_parallelize import build_parallelize_model
