@@ -1,7 +1,7 @@
 # Target class for this configuration
 _target_: verl.workers.config.RolloutConfig
 
-# actor_rollout_ref.rollout.name: hf/vllm/sglang. The default value will be removed in the future
+# actor_rollout_ref.rollout.name: hf/vllm. The default value will be removed in the future
 name: ???
 
 # sync: LLM, async: AsyncLLM
@@ -47,7 +47,7 @@ cudagraph_capture_sizes: null
 free_cache_engine: True
 
 # TP size for rollout. Not effective for hf
-tensor_model_parallel_size: 2
+tensor_model_parallel_size: 1
 
 # DP size for rollout
 data_parallel_size: 1
@@ -116,14 +116,11 @@ over_sample_rate: 0
 # This is only effective for SGLang rollout.
 multi_stage_wake_up: false
 
-# Extra inference engine arguments (vllm, sglang), please refer vllm/sglang official doc for detail
+# Extra inference engine arguments (vllm), please refer vllm official doc for detail
 engine_kwargs:
 
   # vllm engine config
   vllm: {}
-
-  # sglang engine config
-  sglang: {}
 
 # Sampling parameters used during validation.
 val_kwargs:
@@ -153,7 +150,7 @@ multi_turn:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.MultiTurnConfig
 
-  # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
+  # set to True for multi-turn tool interaction tasks
   enable: False
 
   # null for no limit (default max_length // 3)
@@ -313,7 +310,7 @@ profiler:
   # specific tool config
   tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
 
-# prometheus configuration for vllm/sglang server mode
+# prometheus configuration for vllm server mode
 prometheus:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs

@@ -7,8 +7,8 @@ param_offload: false
 # Whether to offload optimizer states to CPU
 optimizer_offload: false
 
-# Ulysses sequence parallel size
-ulysses_sequence_parallel_size: 1
+# ZeRO optimization stage (0, 1, 2, or 3)
+zero_stage: 2
 
 # Model dtype used during initialization
 model_dtype: fp32

@@ -12,15 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Unified helpers for DeepSpeed TP/DP/SP layout and batch normalization.
+Unified helpers for DeepSpeed DP layout and batch normalization.
 
-DeepSpeed workers historically fetched SP/DP/TP settings from multiple
-locations (top-level config, deepspeed_config block, rollout config)
-and reimplemented batch-size normalization per role. This module provides
-one entry point to:
-  - resolve and synchronize the Ulysses SP size for a role
-  - build a parallel layout (dp_rank, sp_rank, collect mask)
-  - normalize per-rank batch sizes consistently
+Sequence parallel support has been removed for the minimal DeepSpeed
+integration; helpers now enforce DP-only layouts while keeping the
+normalization utilities used by the workers.
 """
 
 from __future__ import annotations
@@ -58,39 +54,32 @@ def _get_attr(cfg: Any, name: str, default: int | None = None) -> int | None:
 
 def resolve_and_sync_sp_size(role_cfg: Any) -> int:
     """
-    Resolve SP size from the role config and its deepspeed_config block.
-    Make sure the two places are kept in sync to avoid silent mismatches.
+    Sequence parallel is intentionally disabled for the minimal DeepSpeed subset.
+    Raise early if the config tries to set it.
     """
     top_sp = _get_attr(role_cfg, "ulysses_sequence_parallel_size", None)
     ds_cfg = _get_attr(role_cfg, "deepspeed_config", None)
     ds_sp = _get_attr(ds_cfg, "ulysses_sequence_parallel_size", None) if ds_cfg is not None else None
-
-    # Pick the first non-None value, default to 1
-    sp_candidates = [x for x in (top_sp, ds_sp) if x is not None]
-    sp_size = sp_candidates[0] if len(sp_candidates) > 0 else 1
-
-    # Enforce consistency
-    if top_sp is not None and ds_sp is not None and top_sp != ds_sp:
+    requested = next((v for v in (top_sp, ds_sp) if v is not None), 1)
+    if requested not in (None, 1):
         raise ValueError(
-            f"ulysses_sequence_parallel_size mismatch: top-level={top_sp}, deepspeed_config={ds_sp}. "
-            "Please set them to the same value."
+            "Sequence parallel (ulysses_sequence_parallel_size) is not supported in the minimal "
+            "DeepSpeed integration. Please remove or set it to 1."
         )
 
-    # Sync both views
+    # Normalize any stale config fields back to 1 to keep structure intact.
     if hasattr(role_cfg, "ulysses_sequence_parallel_size"):
-        if _get_attr(role_cfg, "ulysses_sequence_parallel_size") != sp_size:
-            try:
-                role_cfg.ulysses_sequence_parallel_size = sp_size
-            except FrozenInstanceError:
-                pass
+        try:
+            role_cfg.ulysses_sequence_parallel_size = 1
+        except FrozenInstanceError:
+            pass
     if ds_cfg is not None and hasattr(ds_cfg, "ulysses_sequence_parallel_size"):
-        if _get_attr(ds_cfg, "ulysses_sequence_parallel_size") != sp_size:
-            try:
-                ds_cfg.ulysses_sequence_parallel_size = sp_size
-            except FrozenInstanceError:
-                pass
+        try:
+            ds_cfg.ulysses_sequence_parallel_size = 1
+        except FrozenInstanceError:
+            pass
 
-    return int(sp_size)
+    return 1
 
 
 def build_parallel_layout(role_cfg: Any, tp_size: int = 1) -> ParallelLayout:
@@ -101,12 +90,9 @@ def build_parallel_layout(role_cfg: Any, tp_size: int = 1) -> ParallelLayout:
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     sp_size = resolve_and_sync_sp_size(role_cfg)
-    if sp_size < 1 or world_size % sp_size != 0:
-        raise ValueError(f"world_size {world_size} must be divisible by ulysses sp_size {sp_size}")
-
-    dp_size = world_size // sp_size
-    dp_rank = rank // sp_size
-    sp_rank = rank % sp_size
+    dp_size = world_size
+    dp_rank = rank
+    sp_rank = 0
 
     return ParallelLayout(
         world_size=world_size,

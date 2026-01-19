@@ -35,7 +35,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from tensordict import TensorDict
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
-from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForVision2Seq
 
 import verl.utils.torch_functional as verl_F
@@ -43,7 +42,6 @@ from verl import DataProto
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
-from verl.third_party.vllm import vllm_version
 from verl.utils import hf_processor, hf_tokenizer
 from verl.workers.deepspeed_parallel import (
     ParallelLayout,
@@ -78,22 +76,17 @@ from verl.utils.model import (
     print_model_size,
     update_model_config,
 )
-from verl.utils.fsdp_utils import collect_lora_params, replace_lora_wrapper
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.ray_utils import get_event_loop
-from verl.utils.py_functional import append_to_dict, convert_to_regular_types
+from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch
-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from verl.utils.torch_dtypes import PrecisionType
-from verl.utils.torch_functional import masked_mean
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.workers.config import DeepSpeedCriticConfig, DeepSpeedEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.actor import DataParallelPPOActor
 from verl.workers.critic import DataParallelPPOCritic
 from verl.workers.rollout import get_rollout_class
-from verl.workers.sharding_manager.deepspeed_ulysses import DeepSpeedUlyssesShardingManager
-from verl.utils.ulysses import get_ulysses_sequence_parallel_group, set_ulysses_sequence_parallel_group
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -288,29 +281,25 @@ class ActorRolloutRefWorker(Worker):
         if self._is_actor:
             tp_size = rollout_cfg.get("tensor_model_parallel_size", 1) if isinstance(rollout_cfg, dict) else 1
             self.actor_layout = build_parallel_layout(self.config.actor, tp_size=tp_size)
-            normalize_actor_batches(
-                self.config.actor, self.config.rollout.n, self.actor_layout.dp_size, sp_size=self.actor_layout.sp_size
-            )
-            self.actor_ulysses_sequence_parallel_size = self.actor_layout.sp_size
-            self.ulysses_sequence_parallel_size = self.actor_layout.sp_size  # backward compat
+            normalize_actor_batches(self.config.actor, self.config.rollout.n, self.actor_layout.dp_size, sp_size=1)
+            self.ulysses_sequence_parallel_size = 1
             self._register_dispatch_collect_info(
                 "actor", dp_rank=self.actor_layout.dp_rank, is_collect=self.actor_layout.collect
             )
         else:
-            self.actor_ulysses_sequence_parallel_size = 1
             self.ulysses_sequence_parallel_size = 1
 
         if self._is_ref:
             self.ref_layout = build_parallel_layout(self.config.ref)
-            self.ref_ulysses_sequence_parallel_size = self.ref_layout.sp_size
             self._register_dispatch_collect_info(
                 "ref", dp_rank=self.ref_layout.dp_rank, is_collect=self.ref_layout.collect
             )
         else:
-            self.ref_ulysses_sequence_parallel_size = 1
+            self.ref_layout = None
 
-        self._lora_rank = self.config.model.get("lora_rank", 0)
-        self._is_lora = self._lora_rank > 0
+        lora_rank = self.config.model.get("lora_rank", 0)
+        if lora_rank and lora_rank > 0:
+            raise ValueError("DeepSpeed strategy does not support LoRA in the minimal integration.")
 
     def _build_model_optimizer(
         self,
@@ -411,38 +400,12 @@ class ActorRolloutRefWorker(Worker):
             fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
         )
 
-        # Initialize Ulysses SP group for DeepSpeed-HF if requested
-        if layout is not None:
-            sp_size = layout.sp_size
-        elif role == "actor":
-            sp_size = self.actor_ulysses_sequence_parallel_size
-            self.ulysses_sequence_parallel_size = sp_size
-        elif role == "ref":
-            sp_size = self.ref_ulysses_sequence_parallel_size
-        else:
-            sp_size = int(getattr(deepspeed_config, "ulysses_sequence_parallel_size", 1) or 1)
+        # Sequence parallel is disabled in the minimal DeepSpeed integration.
         sp_group = None
-        prev_sp_group = get_ulysses_sequence_parallel_group()
-        _debug_print(f"{role}::_build_model_optimizer: monkey_patch start sp={sp_size}")
-        if sp_size > 1 and torch.distributed.is_initialized():
-            # Use layout to build per-DP SP group to avoid cross-role pollution
-            if layout is None:
-                world = torch.distributed.get_world_size()
-                assert world % sp_size == 0, f"world_size {world} must be divisible by ulysses sp_size {sp_size}"
-                rank = torch.distributed.get_rank()
-                group_id = rank // sp_size
-                ranks = list(range(group_id * sp_size, (group_id + 1) * sp_size))
-            else:
-                ranks = list(range(layout.dp_rank * layout.sp_size, (layout.dp_rank + 1) * layout.sp_size))
-            sp_group = torch.distributed.new_group(ranks=ranks, backend=get_nccl_backend())
-            set_ulysses_sequence_parallel_group(sp_group)
-            # synchronize all ranks inside the SP group before patching
-            torch.distributed.barrier(group=sp_group)
-
         apply_monkey_patch(
             model=actor_module,
             use_remove_padding=use_remove_padding,
-            ulysses_sp_size=sp_size,
+            ulysses_sp_size=1,
             use_fused_kernels=use_fused_kernels,
             fused_kernels_backend=fused_kernels_backend,
         )
@@ -454,23 +417,6 @@ class ActorRolloutRefWorker(Worker):
         if enable_gradient_checkpointing:
             actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-        # LoRA
-        if self._is_lora:
-            print("Applying LoRA to actor module")
-            actor_module.enable_input_require_grads()
-            lora_config = {
-                "task_type": TaskType.CAUSAL_LM,
-                "r": self.config.model.lora_rank,
-                "lora_alpha": self.config.model.lora_alpha,
-                "target_modules": convert_to_regular_types(self.config.model.target_modules),
-                "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
-                "bias": "none",
-            }
-            actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
-        if sp_group is not None:
-            torch.distributed.barrier(group=sp_group)
-        set_ulysses_sequence_parallel_group(prev_sp_group)
-
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -478,9 +424,9 @@ class ActorRolloutRefWorker(Worker):
 
 
         if role == "actor":
-            self.actor_sharding_manager = DeepSpeedUlyssesShardingManager(sp_group)
+            self.actor_sharding_manager = None
         elif role == "ref":
-            self.ref_sharding_manager = DeepSpeedUlyssesShardingManager(sp_group)
+            self.ref_sharding_manager = None
 
         # Initialize DeepSpeed
         if optim_config is not None and role == "actor":
@@ -522,7 +468,8 @@ class ActorRolloutRefWorker(Worker):
 
             # Initialize DeepSpeed engine
             tempWorldSize = ds_config.get("world_size", 1)
-            ds_config["world_size"] = ds_config.get("dp_size", 1)
+            ds_config["world_size"] = dp_size
+            ds_config["dp_size"] = dp_size
             ds_engine, optimizer, _, lr_scheduler = initialize_deepspeed_engine(
                 model=actor_module,
                 config=ds_config,
@@ -704,47 +651,21 @@ class ActorRolloutRefWorker(Worker):
                 load_deepspeed_model_to_gpu(self.actor_engine)
 
             # Get model parameters for rollout - ensure we get full tensors
-            peft_config = None
-            base_model_params = None
             actor_module = self.actor_engine.module if self.actor_engine is not None else self.actor_module
-            peft_model = getattr(actor_module, "_fsdp_wrapped_module", actor_module)
-            if hasattr(peft_model, "peft_config"):
-                peft_config = peft_model.peft_config.get("default", None)
 
             # DeepSpeed engine - need to handle ZeRO partitioned parameters
             # For ZeRO-2, weights are not partitioned, only optimizer states
             # For ZeRO-3, weights ARE partitioned and need gathering
-            if self.actor_engine is not None:
-                if hasattr(self.actor_engine, "get_full_state_dict"):
-                    _debug_print("rollout_mode:prepare_payload:get_full_state_dict")
-                    params = self.actor_engine.get_full_state_dict()
-                else:
-                    params = self.actor_engine.module.state_dict()
+            if self.actor_engine is not None and hasattr(self.actor_engine, "get_full_state_dict"):
+                _debug_print("rollout_mode:prepare_payload:get_full_state_dict")
+                params = self.actor_engine.get_full_state_dict()
+            elif self.actor_engine is not None:
+                params = self.actor_engine.module.state_dict()
             else:
                 params = actor_module.state_dict()
 
-            if peft_config is not None:
-                # Align with FSDP: when base_sync_done==False, send base weights; when True, send LoRA only
-                if not self.base_sync_done:
-                    params = collect_lora_params(
-                        module=actor_module, layered_summon=self.layered_summon, base_sync_done=self.base_sync_done
-                    )
-                    params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
-                else:
-                    params = collect_lora_params(
-                        module=actor_module, layered_summon=self.layered_summon, base_sync_done=self.base_sync_done
-                    )
-
             # Critical: Convert weight keys to match vLLM expectations (like FSDP does)
             params = convert_weight_keys(params, actor_module)
-
-            # sleep_level=2: send base model weights separately
-            if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
-                base_model_params = collect_lora_params(
-                    module=actor_module, layered_summon=self.layered_summon, base_sync_done=False
-                )
-                base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
-                base_model_params = convert_weight_keys(base_model_params, actor_module)
 
             if self._is_offload_param and self.actor_engine is not None:
                 _debug_print("rollout_mode:prepare_payload:offload_to_cpu")
@@ -761,24 +682,15 @@ class ActorRolloutRefWorker(Worker):
                         tensor = tensor.contiguous()
                     yield name, tensor
 
-            if peft_config is not None and self.base_sync_done:
-                per_tensor_param = params.items()
-            else:
-                per_tensor_param = _yield_params(params)
-
-            per_tensor_base_param = None
-            if base_model_params is not None:
-                per_tensor_base_param = _yield_params(base_model_params)
+            per_tensor_param = _yield_params(params)
 
             # Ensure all transfers and memory operations are complete
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             _debug_print("rollout_mode:prepare_payload:done")
-            return params, per_tensor_param, per_tensor_base_param, peft_config
+            return params, per_tensor_param
 
-        params, per_tensor_param, per_tensor_base_param, peft_config = await asyncio.to_thread(
-            _prepare_rollout_payload
-        )
+        params, per_tensor_param = await asyncio.to_thread(_prepare_rollout_payload)
         set_expandable_segments(False)
 
         # Critical fix for DeepSpeed dummy mode compatibility
@@ -788,7 +700,7 @@ class ActorRolloutRefWorker(Worker):
         if self._dummy_rollout:
             # Dummy mode: Skip weight update entirely
             logger.info("Dummy mode: Skipping weight update, vLLM will use its own dummy-initialized weights")
-            del params, per_tensor_param, per_tensor_base_param
+            del params, per_tensor_param
             aggressive_empty_cache(force_sync=True)
             # Mark as synced to prevent future update attempts
             self.base_sync_done = True
@@ -802,13 +714,9 @@ class ActorRolloutRefWorker(Worker):
 
             t_update = time.perf_counter()
             _debug_async_state("rollout_mode:update_weights:start")
-            if per_tensor_base_param is not None:
-                await self.rollout.update_weights(per_tensor_base_param, base_sync_done=False)
-            await self.rollout.update_weights(
-                per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done
-            )
+            await self.rollout.update_weights(per_tensor_param, base_sync_done=self.base_sync_done)
             _debug_async_state("rollout_mode:update_weights:done", t_update)
-            del params, per_tensor_param, per_tensor_base_param
+            del params, per_tensor_param
             aggressive_empty_cache(force_sync=True)
 
             if self.config.rollout.free_cache_engine:
@@ -1247,16 +1155,12 @@ class ActorRolloutRefWorker(Worker):
         ctx = manager if manager is not None else nullcontext()
 
         with ctx:
-            is_lora = data.meta_info.pop("is_lora", False)
-            adapter_ctx = self.actor.disable_adapter() if is_lora else nullcontext()
-
             data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
             data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
             data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
             data.meta_info["temperature"] = self.config.rollout.temperature
 
-            with adapter_ctx:
-                log_probs, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            log_probs, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
 
             output = DataProto.from_dict(
                 tensors={"old_log_probs": log_probs, "entropys": entropys},
@@ -1272,12 +1176,6 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def compute_ref_log_prob(self, data: DataProto):
-        if self._is_lora:
-            data.meta_info["is_lora"] = True
-            data = self.compute_log_prob(data)
-            data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
-            return data
-
         assert self._is_ref
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
@@ -1629,11 +1527,6 @@ class DeepSpeedPPOCritic(DataParallelPPOCritic):
                     clip_used_sum = torch.nan_to_num((clip_used * response_mask).sum(), nan=0.0)
                     vpred_sum = torch.nan_to_num((vpreds * response_mask).sum(), nan=0.0)
 
-                    sp_group = get_ulysses_sequence_parallel_group()
-                    if sp_group is not None and sp_factor > 1:
-                        for t in (token_sum, loss_sum, clip_used_sum, vpred_sum):
-                            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM, group=sp_group)
-
                     global_token_sum = token_sum.clamp_min(1.0)
                     dp_size = max(
                         1,
@@ -1732,10 +1625,11 @@ class CriticWorker(Worker):
         self._register_dispatch_collect_info("critic", dp_rank=self.layout.dp_rank, is_collect=self.layout.collect)
 
         self._is_offload_param = self.config.deepspeed_config.get("param_offload", False)
-        # Ulysses SP for critic dynamic batching
-        self.ulysses_sequence_parallel_size = self.layout.sp_size
-        self._lora_rank = getattr(self.config.model, "lora_rank", 0)
-        self._is_lora = self._lora_rank > 0
+        # Sequence parallel disabled
+        self.ulysses_sequence_parallel_size = 1
+        lora_rank = getattr(self.config.model, "lora_rank", 0)
+        if lora_rank and lora_rank > 0:
+            raise ValueError("DeepSpeed critic does not support LoRA in the minimal integration.")
 
         normalize_critic_batches(self.config, self.layout.dp_size, sp_size=self.layout.sp_size)
 
@@ -1796,62 +1690,28 @@ class CriticWorker(Worker):
                 torch_dtype=torch_dtype,
                 model_config=critic_model_config,
                 trust_remote_code=trust_remote_code,
-            )
+        )
 
         use_remove_padding = getattr(self.config.model, "use_remove_padding", False)
 
-        # Initialize Ulysses SP group for Critic if requested
-        sp_size = int(getattr(self, "ulysses_sequence_parallel_size", 1))
+        # Sequence parallel is disabled for the minimal DeepSpeed integration.
         sp_group = None
-        prev_sp_group = get_ulysses_sequence_parallel_group()
-        if sp_size > 1 and torch.distributed.is_initialized():
-            if self.layout is not None:
-                ranks = list(range(self.layout.dp_rank * sp_size, (self.layout.dp_rank + 1) * sp_size))
-            else:
-                world = torch.distributed.get_world_size()
-                assert world % sp_size == 0, f"world_size {world} must be divisible by ulysses sp_size {sp_size}"
-                rank = torch.distributed.get_rank()
-                group_id = rank // sp_size
-                ranks = list(range(group_id * sp_size, (group_id + 1) * sp_size))
-            sp_group = torch.distributed.new_group(ranks=ranks, backend=get_nccl_backend())
-            set_ulysses_sequence_parallel_group(sp_group)
-            torch.distributed.barrier(group=sp_group)
-
         apply_monkey_patch(
             model=critic_module,
             use_remove_padding=use_remove_padding,
-            ulysses_sp_size=sp_size,
+            ulysses_sp_size=1,
         )
-
-        if sp_group is not None:
-            torch.distributed.barrier(group=sp_group)
-        set_ulysses_sequence_parallel_group(prev_sp_group)
 
         critic_module.to(torch_dtype)
 
         if getattr(self.config.model, "enable_gradient_checkpointing", False):
             critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-        if self._is_lora:
-            print("Applying LoRA to critic module")
-            critic_module.enable_input_require_grads()
-            lora_config = {
-                "task_type": TaskType.CAUSAL_LM,
-                "r": self._lora_rank,
-                "lora_alpha": getattr(self.config.model, "lora_alpha", 16),
-                "target_modules": convert_to_regular_types(getattr(self.config.model, "target_modules", None)),
-                "bias": "none",
-            }
-            exclude_modules = getattr(self.config.model, "exclude_modules", None)
-            if exclude_modules is not None:
-                lora_config["exclude_modules"] = convert_to_regular_types(exclude_modules)
-            critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
-
         if self.rank == 0:
             print_model_size(critic_module)
 
         self.critic_model_config = critic_model_config
-        self.critic_sharding_manager = DeepSpeedUlyssesShardingManager(sp_group)
+        self.critic_sharding_manager = None
 
         # Initialize DeepSpeed
         # Parse mixed precision config (supports str or dict)
@@ -1889,7 +1749,8 @@ class CriticWorker(Worker):
         
         
         tempWorldSize = ds_config.get("world_size", 1)
-        ds_config["world_size"] = ds_config.get("dp_size", 1) 
+        ds_config["world_size"] = dp_size
+        ds_config["dp_size"] = dp_size
         self.critic_engine, optimizer, _, lr_scheduler = initialize_deepspeed_engine(
             model=critic_module,
             config=ds_config,
@@ -2088,7 +1949,7 @@ class RewardModelWorker(Worker):
 
         self.config = config
         self.layout: ParallelLayout | None = None
-        self.reward_sharding_manager: DeepSpeedUlyssesShardingManager | None = None
+        self.reward_sharding_manager = None
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend=get_nccl_backend(),
@@ -2097,9 +1958,9 @@ class RewardModelWorker(Worker):
                 device_id=get_device_id() if torch.cuda.is_available() else None,
             )
 
-        # Build layout (supports DP; optional SP via ulysses_sequence_parallel_size)
+        # Build layout (DP only)
         self.layout = build_parallel_layout(self.config)
-        self.ulysses_sequence_parallel_size = self.layout.sp_size
+        self.ulysses_sequence_parallel_size = 1
 
         # Create training dispatch
         self._register_dispatch_collect_info("reward", dp_rank=self.layout.dp_rank, is_collect=self.layout.collect)
@@ -2157,28 +2018,17 @@ class RewardModelWorker(Worker):
                 trust_remote_code=trust_remote_code,
             )
 
-            # Initialize Ulysses SP group if requested
-            sp_size = self.ulysses_sequence_parallel_size
             sp_group = None
-            prev_sp_group = get_ulysses_sequence_parallel_group()
-            if sp_size > 1 and torch.distributed.is_initialized():
-                ranks = list(range(self.layout.dp_rank * sp_size, (self.layout.dp_rank + 1) * sp_size))
-                sp_group = torch.distributed.new_group(ranks=ranks, backend=get_nccl_backend())
-                set_ulysses_sequence_parallel_group(sp_group)
-                torch.distributed.barrier(group=sp_group)
 
             apply_monkey_patch(
                 model=reward_module,
                 use_remove_padding=config.model.get("use_remove_padding", False),
-                ulysses_sp_size=sp_size,
+                ulysses_sp_size=1,
             )
 
             reward_module.to(torch_dtype)
 
-        if sp_group is not None:
-            torch.distributed.barrier(group=sp_group)
-        set_ulysses_sequence_parallel_group(prev_sp_group)
-        self.reward_sharding_manager = DeepSpeedUlyssesShardingManager(sp_group)
+        self.reward_sharding_manager = None
 
         # Initialize DeepSpeed for inference (no optimizer)
         # Parse mixed precision config
@@ -2207,8 +2057,10 @@ class RewardModelWorker(Worker):
             del ds_config["optimizer"]
 
         # Initialize DeepSpeed engine without optimizer
+        dp_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         tempWorldSize = ds_config.get("world_size", 1)
-        ds_config["world_size"] = ds_config.get("dp_size", 1)
+        ds_config["world_size"] = dp_size
+        ds_config["dp_size"] = dp_size
         ds_engine, _, _, _ = initialize_deepspeed_engine(
             model=reward_module,
             config=ds_config,
@@ -2236,7 +2088,6 @@ class RewardModelWorker(Worker):
             position_ids = micro_batch["position_ids"]
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
-            sp_size = self.ulysses_sequence_parallel_size
 
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(
@@ -2256,25 +2107,12 @@ class RewardModelWorker(Worker):
                         rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
                     ).transpose(0, 1)
 
-                # pad and slice the inputs if sp > 1
-                pad_size = 0
-                if sp_size > 1:
-                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
-                        input_ids_rmpad, position_ids_rmpad, sp_size=sp_size
-                    )
-
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 output = self.reward_module(
                     input_ids=input_ids_rmpad, attention_mask=None, position_ids=position_ids_rmpad, use_cache=False
                 )
                 reward_rmpad = output.logits
                 reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
-
-                # gather output if sp > 1
-                if sp_size > 1:
-                    reward_rmpad = gather_outputs_and_unpad(
-                        reward_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
-                    )
 
                 # pad it back
                 rm_score = pad_input(reward_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)

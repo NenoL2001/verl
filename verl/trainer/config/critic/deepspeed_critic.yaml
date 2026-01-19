@@ -45,9 +45,6 @@ train_micro_batch_size_per_gpu: null
 # Gradient clipping for critic updates
 grad_clip: 1.0
 
-# Sequence parallelism size
-ulysses_sequence_parallel_size: 1
-
 # Optimizer configuration tailored for DeepSpeed
 optim:
   _target_: verl.workers.config.DeepSpeedOptimizerConfig

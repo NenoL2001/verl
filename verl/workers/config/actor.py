@@ -342,3 +342,15 @@ class DeepSpeedActorConfig(ActorConfig):
         super().__post_init__()
         if self.zero_stage not in [0, 1, 2, 3]:
             raise ValueError(f"zero_stage must be 0, 1, 2, or 3, got {self.zero_stage}")
+        if self.ulysses_sequence_parallel_size not in (None, 1):
+            raise ValueError("ulysses_sequence_parallel_size is not supported for DeepSpeed strategy; use 1.")
+        # Keep engine config in sync and disallow SP/off-spec overrides
+        if hasattr(self.deepspeed_config, "zero_stage"):
+            if self.deepspeed_config.zero_stage not in (None, self.zero_stage):
+                raise ValueError(
+                    f"zero_stage mismatch between actor ({self.zero_stage}) and deepspeed_config "
+                    f"({self.deepspeed_config.zero_stage}). Please set one value."
+                )
+            self.deepspeed_config.zero_stage = self.zero_stage
+        if hasattr(self.deepspeed_config, "ulysses_sequence_parallel_size"):
+            self.deepspeed_config.ulysses_sequence_parallel_size = 1

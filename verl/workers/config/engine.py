@@ -191,18 +191,13 @@ class FSDPEngineConfig(EngineConfig):
 
 # ---------------- DeepSpeed Configs -----------------
 @dataclass
-class DeepSpeedEngineConfig(BaseConfig):
+class DeepSpeedEngineConfig(EngineConfig):
     """Configuration for DeepSpeed engine (minimal subset)."""
-
-    # offload & parallel
-    param_offload: bool = False
-    optimizer_offload: bool = False
-    ulysses_sequence_parallel_size: int = 1
 
     # dtype / precision controls
     model_dtype: str = "fp32"  # initial parameter dtype
-    mixed_precision: Optional[dict[str, Any]] = None  # e.g. {"param_dtype": "bf16"}
-    forward_only: bool = False
+    mixed_precision: Optional[dict[str, Any] | str] = None  # e.g. {"param_dtype": "bf16"} or "bf16"/"fp16"
+    zero_stage: int = 2
 
     # features
     use_torch_compile: bool = False
@@ -212,14 +207,14 @@ class DeepSpeedEngineConfig(BaseConfig):
     strategy: str = field(default="deepspeed", init=False)
 
     def __post_init__(self):
+        super().__post_init__()
         # basic field validation
-        if self.ulysses_sequence_parallel_size < 1:
-            raise ValueError("ulysses_sequence_parallel_size must be >= 1")
         if self.model_dtype not in ("fp32", "bf16", "fp16"):
             raise ValueError(f"Unsupported model_dtype {self.model_dtype}")
-        # mixed_precision can be: None | str ("fp16"/"bf16") | dict
-        if self.mixed_precision is not None and not isinstance(self.mixed_precision, dict | str):
+        if self.mixed_precision is not None and not isinstance(self.mixed_precision, (dict, str)):
             raise ValueError("mixed_precision must be a dict, str, or None")
+        if self.zero_stage not in (0, 1, 2, 3):
+            raise ValueError(f"zero_stage must be 0/1/2/3, got {self.zero_stage}")
 
 
 @dataclass

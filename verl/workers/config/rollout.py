@@ -222,6 +222,8 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        if self.name == "sglang":
+            raise ValueError("Rollout backend 'sglang' is not supported; please use 'vllm' or 'hf'.")
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(

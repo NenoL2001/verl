@@ -25,10 +25,12 @@ import torch.distributed
 from tensordict import TensorDict
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from transformers import GenerationConfig
+from transformers import AutoModelForCausalLM, GenerationConfig
 
 from verl import DataProto
 from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.fs import copy_to_local
+from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import get_response_mask
 
 from .base import BaseRollout
@@ -37,10 +39,46 @@ __all__ = ["HFRollout"]
 
 
 class HFRollout(BaseRollout):
-    def __init__(self, module: nn.Module, config):
-        super().__init__()
-        self.config = config
-        self.module = module
+    def __init__(self, *args, **kwargs):
+        """
+        Supports both legacy construction (module, config) and BaseRollout-style
+        construction (config, model_config, device_mesh).
+        """
+        module = kwargs.pop("module", None)
+        device_mesh = kwargs.get("device_mesh", None)
+        model_config = kwargs.get("model_config", None)
+        config = kwargs.pop("config", None)
+
+        if args:
+            # Legacy path: HFRollout(module, config)
+            if module is None and isinstance(args[0], nn.Module):
+                module = args[0]
+                if len(args) > 1 and config is None:
+                    config = args[1]
+            elif config is None:
+                # BaseRollout-style: HFRollout(config, model_config, device_mesh)
+                config = args[0]
+                if len(args) > 1 and model_config is None:
+                    model_config = args[1]
+
+        if module is not None:
+            # Minimal setup for legacy callers (tests/FSRD paths)
+            self.config = config
+            self.model_config = model_config
+            self.device_mesh = device_mesh
+            self.module = module
+            return
+
+        assert config is not None and model_config is not None, "config and model_config are required for HFRollout"
+        super().__init__(config=config, model_config=model_config, device_mesh=device_mesh)
+
+        local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.use_shm)
+        torch_dtype = PrecisionType.to_dtype(getattr(self.config, "dtype", "bfloat16"))
+        self.module = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=local_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=self.model_config.trust_remote_code,
+        ).to(get_device_name())
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]

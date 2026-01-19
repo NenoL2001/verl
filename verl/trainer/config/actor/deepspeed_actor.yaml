@@ -42,9 +42,6 @@ train_micro_batch_size_per_gpu: null
 # Gradient clipping for actor updates
 grad_clip: 1.0
 
-# Sequence parallelism size for Ulysses-style model parallelism
-ulysses_sequence_parallel_size: 1
-
 # Calculate entropy with chunking to reduce memory peak
 entropy_from_logits_with_chunking: false
 

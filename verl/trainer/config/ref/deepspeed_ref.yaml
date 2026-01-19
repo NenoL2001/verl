@@ -1,0 +1,67 @@
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+# defaults specify the default config from each component
+defaults:
+
+  # base ref config
+  - ref
+
+  # deepspeed engine config
+  - ../engine@deepspeed_config: deepspeed
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Target class for this configuration
+_target_: verl.workers.config.DeepSpeedActorConfig
+
+# Strategy identifier
+strategy: deepspeed
+
+# ZeRO optimization stage for ref policy (0 keeps it vanilla)
+zero_stage: 0
+
+# Whether to remove padding tokens in inputs during training
+use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}
+
+# Optional fused kernels
+use_fused_kernels: False
+
+# Entropy computation options
+entropy_from_logits_with_chunking: False
+entropy_checkpointing: False
+
+# Gradient accumulation steps (used for log-prob computation)
+gradient_accumulation_steps: 1
+
+# Training batch size (global, forward-only for ref)
+train_batch_size: null
+
+# Micro batch size per GPU (forward-only for ref)
+train_micro_batch_size_per_gpu: null
+
+# PPO-style batch controls (kept for structural parity)
+ppo_mini_batch_size: 1
+ppo_micro_batch_size_per_gpu: 1
+ppo_max_token_len_per_gpu: 16384
+ppo_epochs: 1
+
+# KL settings (no-op for ref, kept for completeness)
+use_kl_loss: False
+kl_loss_coef: 0.0
+kl_loss_type: kl
+
+# Gradient clipping for ref updates (kept for parity)
+grad_clip: 1.0
+
+# DeepSpeed engine configuration
+deepspeed_config:
+  _target_: verl.workers.config.DeepSpeedEngineConfig
+  model_dtype: fp32
+  mixed_precision: bf16
+  param_offload: false
+  optimizer_offload: false
