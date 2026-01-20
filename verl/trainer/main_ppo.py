@@ -126,6 +126,10 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        actor_strategy = config.actor_rollout_ref.actor.strategy
+        if actor_strategy == "deepspeed" and use_legacy_worker_impl == "auto":
+            # DeepSpeed is only supported in the new engine path.
+            use_legacy_worker_impl = "disable"
 
         # use new model engine implementation
         if use_legacy_worker_impl == "disable":
@@ -150,16 +154,22 @@ class TaskRunner:
 
         # Note: sync mode validation is now handled in RolloutConfig.__post_init__
         # Always use async worker since sync mode is deprecated and rejected
-        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+        if actor_strategy in {"fsdp", "fsdp2"}:
             from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
 
             actor_rollout_cls = AsyncActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
-        elif config.actor_rollout_ref.actor.strategy == "megatron":
+        elif actor_strategy == "megatron":
             from verl.workers.megatron_workers import AsyncActorRolloutRefWorker
 
             actor_rollout_cls = AsyncActorRolloutRefWorker
+            ray_worker_group_cls = RayWorkerGroup
+
+        elif actor_strategy == "deepspeed":
+            from verl.workers.engine_workers import ActorRolloutRefWorker
+
+            actor_rollout_cls = ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
         else:
@@ -172,7 +182,11 @@ class TaskRunner:
     def add_critic_worker(self, config):
         """Add critic worker to role mapping."""
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-        if config.critic.strategy in {"fsdp", "fsdp2"}:
+        critic_strategy = config.critic.strategy
+        if critic_strategy == "deepspeed" and use_legacy_worker_impl == "auto":
+            use_legacy_worker_impl = "disable"
+
+        if critic_strategy in {"fsdp", "fsdp2"}:
             if use_legacy_worker_impl in ["auto", "enable"]:
                 from verl.workers.fsdp_workers import CriticWorker
             elif use_legacy_worker_impl == "disable":
@@ -184,9 +198,13 @@ class TaskRunner:
             else:
                 raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
-        elif config.critic.strategy == "megatron":
+        elif critic_strategy == "megatron":
             # TODO: switch this to TrainingWorker as well
             from verl.workers.megatron_workers import CriticWorker
+
+        elif critic_strategy == "deepspeed":
+            from verl.workers.engine_workers import TrainingWorker
+            CriticWorker = TrainingWorker
 
         else:
             raise NotImplementedError

@@ -21,11 +21,18 @@ from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
 from verl.utils.profiler.config import ProfilerConfig
 
-from .engine import FSDPEngineConfig, McoreEngineConfig
+from .engine import DeepSpeedEngineConfig, FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = [
+    "PolicyLossConfig",
+    "RouterReplayConfig",
+    "ActorConfig",
+    "DeepSpeedActorConfig",
+    "FSDPActorConfig",
+    "McoreActorConfig",
+]
 
 
 @dataclass
@@ -306,3 +313,26 @@ class FSDPActorConfig(ActorConfig):
                 raise ValueError(
                     "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
                 )
+
+
+@dataclass
+class DeepSpeedActorConfig(ActorConfig):
+    """Configuration for DeepSpeed actor models."""
+
+    strategy: str = "deepspeed"
+    grad_clip: float = 1.0
+    deepspeed: DeepSpeedEngineConfig = field(default_factory=DeepSpeedEngineConfig)
+    use_remove_padding: bool = False
+    use_rollout_log_probs: bool = False
+    calculate_sum_pi_squared: bool = False
+    sum_pi_squared_checkpointing: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.engine = self.deepspeed
+        # Align offload flags with offload shorthand.
+        offload_enabled = self.deepspeed.offload in {"cpu", "nvme", "auto"}
+        if offload_enabled:
+            self.deepspeed.param_offload = True
+            # Optimizer offload requires ZeRO-2 or ZeRO-3.
+            self.deepspeed.optimizer_offload = self.deepspeed.zero_stage >= 2
