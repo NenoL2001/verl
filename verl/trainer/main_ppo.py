@@ -20,7 +20,7 @@ import socket
 
 import hydra
 import ray
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -127,12 +127,12 @@ class TaskRunner:
 
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         actor_strategy = config.actor_rollout_ref.actor.strategy
-        if actor_strategy == "deepspeed" and use_legacy_worker_impl == "auto":
-            # DeepSpeed is only supported in the new engine path.
-            use_legacy_worker_impl = "disable"
+
+        if actor_strategy == "deepspeed" and use_legacy_worker_impl == "disable":
+            use_legacy_worker_impl = "enable"
 
         # use new model engine implementation
-        if use_legacy_worker_impl == "disable":
+        if use_legacy_worker_impl == "disable" and actor_strategy != "deepspeed":
             from verl.workers.engine_workers import ActorRolloutRefWorker
 
             actor_rollout_cls = ActorRolloutRefWorker
@@ -167,7 +167,7 @@ class TaskRunner:
             ray_worker_group_cls = RayWorkerGroup
 
         elif actor_strategy == "deepspeed":
-            from verl.workers.engine_workers import ActorRolloutRefWorker
+            from verl.workers.deepspeed_workers import AsyncActorRolloutRefWorker as ActorRolloutRefWorker
 
             actor_rollout_cls = ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
@@ -183,8 +183,8 @@ class TaskRunner:
         """Add critic worker to role mapping."""
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         critic_strategy = config.critic.strategy
-        if critic_strategy == "deepspeed" and use_legacy_worker_impl == "auto":
-            use_legacy_worker_impl = "disable"
+        if critic_strategy == "deepspeed" and use_legacy_worker_impl == "disable":
+            use_legacy_worker_impl = "enable"
 
         if critic_strategy in {"fsdp", "fsdp2"}:
             if use_legacy_worker_impl in ["auto", "enable"]:
@@ -203,8 +203,7 @@ class TaskRunner:
             from verl.workers.megatron_workers import CriticWorker
 
         elif critic_strategy == "deepspeed":
-            from verl.workers.engine_workers import TrainingWorker
-            CriticWorker = TrainingWorker
+            from verl.workers.deepspeed_workers import CriticWorker
 
         else:
             raise NotImplementedError
@@ -285,6 +284,15 @@ class TaskRunner:
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+
+        # Always use the legacy worker implementation for DeepSpeed while the engine path is disabled.
+        actor_strategy = config.actor_rollout_ref.actor.strategy
+        critic_strategy = config.critic.strategy
+        if "deepspeed" in {actor_strategy, critic_strategy}:
+            ds_mode = config.trainer.get("use_legacy_worker_impl", "auto")
+            if ds_mode != "enable":
+                with open_dict(config.trainer):
+                    config.trainer.use_legacy_worker_impl = "enable"
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
