@@ -136,6 +136,8 @@ def load_reward_manager(
             load_extern_object(module_path=module_cfg.path, object_name=reward_manager_cls_name),
         )
 
+    default_reward_kwargs = dict(config.reward.get("reward_kwargs", {}))
+
     if compute_score is None:
         sandbox_config = config.reward_model.get("sandbox_fusion")
         sandbox_url = sandbox_config.get("url") if sandbox_config else None
@@ -149,9 +151,13 @@ def load_reward_manager(
                 sandbox_fusion_url=sandbox_url,
                 concurrent_semaphore=_concurrent_semaphore,
                 memory_limit_mb=memory_limit_mb,
+                **default_reward_kwargs,
             )
         else:
-            final_compute_score = default_compute_score
+            if default_reward_kwargs:
+                final_compute_score = partial(default_compute_score, **default_reward_kwargs)
+            else:
+                final_compute_score = default_compute_score
 
     # Instantiate and return the reward manager with the specified parameters
     # RewardManagerBase subclasses (like RateLimitedRewardLoopManager) don't accept num_examine
